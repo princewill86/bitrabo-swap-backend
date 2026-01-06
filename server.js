@@ -1,301 +1,288 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios');
 const BigNumber = require('bignumber.js');
-const {
-  createConfig,
-  getRoutes,
-  executeRoute,
-  getTokens,
-} = require('@lifi/sdk');
+const { ethers } = require('ethers');
+const { createConfig, getRoutes, getTokens } = require('@lifi/sdk');
 
 const app = express();
+const PORT = process.env.PORT || 3000;
+
+// --- 1. LIFI CONFIGURATION ---
+createConfig({
+  integrator: process.env.BITRABO_INTEGRATOR || 'bitrabo',
+  fee: Number(process.env.BITRABO_FEE || 0.0025),
+});
+
+// --- 2. RPC PROVIDERS (For Allowance Checks) ---
+// Add your own RPCs here for better stability
+const RPCS = {
+  1: 'https://eth.llamarpc.com',
+  56: 'https://binance.llamarpc.com',
+  137: 'https://polygon.llamarpc.com',
+  42161: 'https://arb1.arbitrum.io/rpc',
+  10: 'https://mainnet.optimism.io',
+  8453: 'https://mainnet.base.org',
+};
+
 app.use(cors());
 app.use(express.json());
 
-// LI.FI global config – Bitrabo as integrator with fee
-createConfig({
-  integrator: process.env.BITRABO_INTEGRATOR || 'bitrabo',
-  routeOptions: {
-    fee: Number(process.env.BITRABO_FEE || 0.0025),
-  },
+// --- 3. HELPER FUNCTIONS ---
+
+// Wraps response in OneKey's expected format: { code: 0, data: ... }
+const ok = (data) => ({ code: 0, data });
+
+const toLiFiChain = (id) => (id ? parseInt(id.replace('evm--', '')) : 1);
+const toOneKeyChain = (id) => `evm--${id}`;
+
+const ERC20_ABI = [
+  "function allowance(address owner, address spender) view returns (uint256)",
+  "function decimals() view returns (uint8)"
+];
+
+// --- 4. CORE ENDPOINTS ---
+
+/**
+ * GET /swap/v1/check-support
+ * CRITICAL: Fixes "No provider supported" error.
+ * Tells frontend that this network is supported.
+ */
+app.get('/swap/v1/check-support', (req, res) => {
+  const { networkId } = req.query;
+  // We simply say "available" for any network we are asked about
+  res.json(ok([{ status: 'available', networkId }]));
 });
 
-const PORT = process.env.PORT || 3000;
+/**
+ * GET /swap/v1/providers/list
+ * CRITICAL: Fixes the 404 error.
+ * Tells frontend which providers to look for in the quote response.
+ */
+app.get('/swap/v1/providers/list', (req, res) => {
+  res.json(ok([
+    {
+      provider: 'lifi',
+      name: 'Li.Fi (Bitrabo)',
+      logoURI: 'https://raw.githubusercontent.com/lifinance/types/main/src/assets/logo.png',
+      status: 'available',
+      priority: 1
+    }
+  ]));
+});
 
-// OneKey style wrapper
-function ok(data) {
-  return { code: 0, data };
-}
+/**
+ * GET /swap/v1/native-token-config
+ * Required for ETH/Native swaps to work (calculates gas reserve).
+ */
+app.get('/swap/v1/native-token-config', (req, res) => {
+  res.json(ok({
+    networkId: req.query.networkId,
+    reserveGas: '21000', 
+    minValue: '0'
+  }));
+});
 
-// Normalize native token address for output (OneKey uses 0xeeee...)
-function native(addr) {
-  const lowerAddr = addr ? addr.toLowerCase() : '';
-  if (
-    lowerAddr === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' ||
-    lowerAddr === '0x0000000000000000000000000000000000000000'
-  ) {
-    return '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
-  }
-  return addr;
-}
-
-// Normalize native token address for Li.FI input (Li.FI uses 0x0000...)
-function lifiNative(addr) {
-  const lowerAddr = addr ? addr.toLowerCase() : '';
-  if (
-    lowerAddr === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' ||
-    lowerAddr === '0x0000000000000000000000000000000000000000'
-  ) {
-    return '0x0000000000000000000000000000000000000000';
-  }
-  return addr;
-}
-
-// ---------------- NETWORKS ----------------
+/**
+ * GET /swap/v1/networks
+ */
 app.get('/swap/v1/networks', async (req, res) => {
   try {
-    const tokens = await getTokens();
-    const chainIds = Object.keys(tokens.tokens || {});
-    const out = chainIds.map((chainId) => ({
-      networkId: `evm--${chainId}`,
-      supportSingleSwap: true,
+    const { tokens } = await getTokens();
+    const networks = Object.keys(tokens).map(id => ({
+      networkId: toOneKeyChain(id),
+      name: `EVM ${id}`,
+      shortcode: 'ETH', // Simplified
+      logoURI: '',
       supportCrossChainSwap: true,
-      supportLimit: false,
-      defaultSelectToken: [],
+      supportSingleSwap: true,
+      defaultSelectToken: []
     }));
-    res.json(ok(out));
-  } catch (e) {
-    console.error('Networks error:', e);
-    res.json(ok([]));
-  }
+    res.json(ok(networks));
+  } catch (e) { res.json(ok([])); }
 });
 
-// ---------------- TOKENS ----------------
+/**
+ * GET /swap/v1/tokens
+ */
 app.get('/swap/v1/tokens', async (req, res) => {
   try {
     const { networkId, keywords } = req.query;
-    const all = await getTokens();
-    const chainId = networkId ? String(networkId).replace('evm--', '') : null;
-    let list = [];
-
-    if (chainId && all.tokens?.[chainId]) {
-      list = all.tokens[chainId];
-    } else {
-      list = Object.values(all.tokens || {}).flat();
-    }
-
+    const chainId = toLiFiChain(networkId);
+    const { tokens } = await getTokens({ chains: [chainId] });
+    
+    let list = tokens[chainId] || [];
     if (keywords) {
-      const k = String(keywords).toLowerCase();
-      list = list.filter(
-        (t) =>
-          String(t.symbol).toLowerCase().includes(k) ||
-          String(t.name).toLowerCase().includes(k),
-      );
+      const k = keywords.toLowerCase();
+      list = list.filter(t => t.name.toLowerCase().includes(k) || t.symbol.toLowerCase().includes(k));
     }
 
-    const mapped = list.slice(0, 50).map((t) => ({
+    res.json(ok(list.slice(0, 100).map(t => ({
       name: t.name,
       symbol: t.symbol,
       decimals: t.decimals,
+      contractAddress: t.address,
       logoURI: t.logoURI,
-      contractAddress: native(t.address),
-      networkId: `evm--${t.chainId}`,
-      reservationValue: '0',
-      price: '0',
-    }));
+      networkId: networkId,
+      isNative: t.address === '0x0000000000000000000000000000000000000000',
+    }))));
+  } catch (e) { res.json(ok([])); }
+});
 
-    res.json(ok(mapped));
+/**
+ * GET /swap/v1/allowance
+ * Checks on-chain if the user needs to approve the token.
+ */
+app.get('/swap/v1/allowance', async (req, res) => {
+  try {
+    const { networkId, tokenAddress, spenderAddress, walletAddress } = req.query;
+    const chainId = toLiFiChain(networkId);
+
+    // If native token (e.g. ETH), allowance is always infinite
+    if (tokenAddress === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee') {
+      return res.json(ok({ allowance: '115792089237316195423570985008687907853269984665640564039457584007913129639935' }));
+    }
+
+    const rpc = RPCS[chainId];
+    if (!rpc) {
+      // If we don't have an RPC, assume 0 allowance to force an approve (safer)
+      return res.json(ok({ allowance: '0' })); 
+    }
+
+    const provider = new ethers.JsonRpcProvider(rpc);
+    const contract = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
+    const allowance = await contract.allowance(walletAddress, spenderAddress);
+    
+    res.json(ok({ allowance: allowance.toString() }));
+
   } catch (e) {
-    console.error('Tokens error:', e);
-    res.json(ok([]));
+    console.error("Allowance Error:", e);
+    res.json(ok({ allowance: '0' }));
   }
 });
 
-// ---------------- QUOTE ----------------
+// --- 5. QUOTE & TX LOGIC ---
+
+async function fetchLiFiQuotes(params) {
+  try {
+    const fromChain = toLiFiChain(params.fromNetworkId);
+    const toChain = toLiFiChain(params.toNetworkId);
+    const fromToken = params.fromTokenAddress || '0x0000000000000000000000000000000000000000';
+    const toToken = params.toTokenAddress || '0x0000000000000000000000000000000000000000';
+    const amount = params.fromTokenAmount;
+    const user = params.userAddress;
+
+    const routesResponse = await getRoutes({
+      fromChainId: fromChain,
+      toChainId: toChain,
+      fromTokenAddress: fromToken,
+      toTokenAddress: toToken,
+      fromAmount: amount,
+      fromAddress: user,
+      slippage: Number(params.slippagePercentage || 0.5) / 100,
+      options: {
+        integrator: process.env.BITRABO_INTEGRATOR || 'bitrabo',
+        fee: Number(process.env.BITRABO_FEE || 0.0025),
+      },
+    });
+
+    if (!routesResponse.routes || routesResponse.routes.length === 0) return [];
+
+    return routesResponse.routes.map((route, i) => {
+      const isBest = i === 0;
+      return {
+        info: {
+          provider: 'lifi',
+          providerName: 'Bitrabo (Li.Fi)',
+          providerLogoURI: 'https://raw.githubusercontent.com/lifinance/types/main/src/assets/logo.png',
+        },
+        fromTokenInfo: {
+          networkId: params.fromNetworkId,
+          contractAddress: route.fromToken.address,
+          symbol: route.fromToken.symbol,
+          name: route.fromToken.name,
+          decimals: route.fromToken.decimals,
+          isNative: route.fromToken.address === '0x0000000000000000000000000000000000000000',
+        },
+        toTokenInfo: {
+          networkId: params.toNetworkId,
+          contractAddress: route.toToken.address,
+          symbol: route.toToken.symbol,
+          name: route.toToken.name,
+          decimals: route.toToken.decimals,
+          isNative: route.toToken.address === '0x0000000000000000000000000000000000000000',
+        },
+        fromAmount: route.fromAmount,
+        toAmount: route.toAmount,
+        toAmountMin: route.toAmountMin,
+        instantRate: new BigNumber(route.toAmount).div(route.fromAmount).toString(),
+        estimatedTime: 60,
+        kind: 'sell',
+        isBest,
+        receivedBest: isBest,
+        quoteResultCtx: route, 
+        routesData: route.steps.map(s => ({
+            name: s.toolDetails.name,
+            part: 100,
+            subRoutes: [[{ name: s.toolDetails.name, part: 100 }]] 
+        })),
+        fee: {
+          percentageFee: Number(process.env.BITRABO_FEE || 0.0025),
+          feeReceiver: process.env.BITRABO_FEE_RECEIVER
+        }
+      };
+    });
+  } catch (e) {
+    console.error("Quote Error:", e.message);
+    return [];
+  }
+}
+
 app.get('/swap/v1/quote', async (req, res) => {
-  try {
-    const p = req.query;
-    const fromChainId = Number(String(p.fromNetworkId || '').replace('evm--', ''));
-    const toChainId = Number(String(p.toNetworkId || '').replace('evm--', ''));
-
-    const routes = await getRoutes({
-      fromChainId,
-      toChainId,
-      fromTokenAddress: lifiNative(p.fromTokenAddress) || '0x0000000000000000000000000000000000000000',
-      toTokenAddress: lifiNative(p.toTokenAddress),
-      fromAmount: p.fromTokenAmount,
-      fromAddress: p.userAddress,
-      toAddress: p.userAddress,
-      slippage: Number(p.slippagePercentage) / 100 || 0.005,
-    });
-
-    if (!routes.routes?.length) {
-      console.log('No routes found for params:', p);
-      return res.json(ok([]));
-    }
-
-    const best = routes.routes[0];
-
-    const quote = {
-      info: {
-        provider: 'lifi',
-        providerName: 'LI.FI',
-      },
-      fromTokenInfo: {
-        contractAddress: native(best.fromToken.address),
-        networkId: p.fromNetworkId,
-        decimals: best.fromToken.decimals,
-        symbol: best.fromToken.symbol,
-        name: best.fromToken.name,
-      },
-      toTokenInfo: {
-        contractAddress: native(best.toToken.address),
-        networkId: p.toNetworkId,
-        decimals: best.toToken.decimals,
-        symbol: best.toToken.symbol,
-        name: best.toToken.name,
-      },
-      fromAmount: best.fromAmount,
-      toAmount: best.toAmount,
-      toAmountMin: best.toAmountMin,
-      instantRate: new BigNumber(best.toAmount).div(best.fromAmount).toString(),
-      fee: {
-        percentageFee: Number(process.env.BITRABO_FEE || 0.0025),
-        feeReceiver: process.env.BITRABO_FEE_RECEIVER,
-      },
-      isBest: true,
-      receivedBest: true,
-      estimatedTime: best.estimate?.etaSeconds || 180,
-      allowanceResult: { isApproved: true },
-      routesData: best.steps.map((s) => ({
-        name: s.toolDetails?.name || s.tool,
-        part: 100,
-        subRoutes: [],
-      })),
-      quoteExtraData: {},
-      kind: 'sell',
-      quoteResultCtx: best,
-    };
-
-    res.json(ok([quote]));
-  } catch (e) {
-    console.error('Quote error:', e);
-    res.json(ok([]));
-  }
+  const quotes = await fetchLiFiQuotes(req.query);
+  res.json(ok(quotes));
 });
 
-// ---------------- BUILD TX ----------------
-app.post('/swap/v1/build-tx', async (req, res) => {
-  try {
-    const { quoteResultCtx } = req.body;
-    if (!quoteResultCtx) {
-      return res.status(400).json(ok(null));
-    }
-    const execution = await executeRoute({ route: quoteResultCtx });
-    res.json(ok({
-      result: {
-        info: { provider: 'lifi', providerName: 'LI.FI' },
-      },
-      tx: execution.transactionRequest,
-      raw: execution,
-    }));
-  } catch (e) {
-    console.error('Build-tx error:', e);
-    res.json(ok(null));
-  }
-});
-
-// ---------------- SSE QUOTE EVENTS ----------------
 app.get('/swap/v1/quote/events', async (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  
   try {
-    const quotes = await axios.get(`http://localhost:${PORT}/swap/v1/quote`, {
-      params: req.query,
-      timeout: 10000,
-    });
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.write(`data: ${JSON.stringify(quotes.data)}\n\n`);
-    setTimeout(() => {
-      res.write('data: {"type":"done"}\n\n');
-      res.end();
-    }, 100);
+    const quotes = await fetchLiFiQuotes(req.query);
+    res.write(`data: ${JSON.stringify(quotes)}\n\n`);
+    res.write(`data: {"type":"done"}\n\n`);
   } catch (e) {
-    console.error('SSE error:', e);
-    res.write('data: {"type":"error"}\n\n');
+    res.write(`data: {"type":"error"}\n\n`);
+  } finally {
     res.end();
   }
 });
 
-// ---------------- PROVIDERS LIST ----------------
-app.get('/swap/v1/providers/list', (req, res) => {
-  res.json(ok([
-    {
-      providerInfo: {
-        provider: 'lifi',
-        name: 'LI.FI',
-        logoURI: 'https://li.fi/images/logo.svg',
-      },
-      enable: true,
-      disableNetworks: [],
-    },
-  ]));
+app.post('/swap/v1/build-tx', async (req, res) => {
+  try {
+    const { quoteResultCtx, userAddress } = req.body;
+    if (!quoteResultCtx || !quoteResultCtx.steps) return res.json(ok(null));
+
+    const step = quoteResultCtx.steps[0]; 
+    const tx = step.transactionRequest;
+
+    if (!tx) throw new Error("No transaction request found");
+
+    res.json(ok({
+      result: { info: { provider: 'lifi', providerName: 'Bitrabo' } },
+      tx: {
+        to: tx.to,
+        value: tx.value ? new BigNumber(tx.value).toFixed() : '0',
+        data: tx.data,
+        from: userAddress,
+        gas: tx.gasLimit ? new BigNumber(tx.gasLimit).toFixed() : undefined
+      }
+    }));
+  } catch (e) {
+    console.error(e);
+    res.json(ok(null));
+  }
 });
 
-// ---------------- CHECK SUPPORT ----------------
-app.get('/swap/v1/check-support', (req, res) => {
-  const { networkId } = req.query;
-  const supported = networkId?.startsWith('evm--');
-  res.json(ok([
-    {
-      supported,
-      reason: supported ? null : 'Network not supported',
-    },
-  ]));
-});
-
-// ---------------- ALLOWANCE (always approved for simplicity) ----------------
-app.get('/swap/v1/allowance', (req, res) => {
-  res.json(ok({
-    isApproved: true,
-    allowance: '115792089237316195423570985008687907853269984665640564039457584007913129639935',
-  }));
-});
-
-// ---------------- SPEED CONFIG ----------------
-app.get('/swap/v1/speed-config', (req, res) => {
-  res.json(ok({
-    provider: '',
-    supportSpeedSwap: false,
-    speedConfig: { slippage: 0.5 },
-    speedDefaultSelectToken: null,
-  }));
-});
-
-// ---------------- NATIVE TOKEN CONFIG ----------------
-app.get('/swap/v1/native-token-config', (req, res) => {
-  res.json(ok({
-    networkId: req.query.networkId || '',
-    reserveGas: '0.01',
-  }));
-});
-
-// ---------------- SWAP CONFIG ----------------
-app.get('/swap/v1/swap-config', (req, res) => {
-  res.json(ok({
-    swapMevNetConfig: [],
-  }));
-});
-
-// ---------------- STATE TX (simple success response) ----------------
-app.post('/swap/v1/state-tx', (req, res) => {
-  res.json(ok({
-    state: 'SUCCESS',
-    dealReceiveAmount: req.body.toTokenAmount || '0',
-  }));
-});
-
-app.listen(PORT, () => {
-  console.log(`Bitrabo Swap Backend running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Bitrabo Mirror Running on ${PORT}`));
