@@ -5,6 +5,7 @@ const cors = require('cors');
 const { createConfig, getRoutes } = require('@lifi/sdk');
 const axios = require('axios');
 const BigNumber = require('bignumber.js');
+const { createProxyMiddleware } = require('http-proxy-middleware');
 
 const app = express();
 app.use(cors());
