@@ -7,45 +7,52 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Correct initialization for LI.FI SDK v3+
 const lifi = new LiFi({
-  integrator: process.env.BITRABO_INTEGRATOR,
+  integrator: process.env.BITRABO_INTEGRATOR || 'bitrabo',
 });
 
-const PORT = process.env.PORT || process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
 
-// /v1/quote (mirrors OneKey)
+// /v1/quote endpoint (mirrors OneKey)
 app.get('/v1/quote', async (req, res) => {
   try {
+    const params = req.query;
+
+    // Map OneKey params to LI.FI
     const quote = await lifi.getQuote({
-      fromChain: req.query.fromNetworkId.replace('evm--', ''),
-      toChain: req.query.toNetworkId.replace('evm--', ''),
-      fromToken: req.query.fromTokenAddress || '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
-      toToken: req.query.toTokenAddress,
-      fromAmount: req.query.fromTokenAmount,
-      fromAddress: req.query.userAddress,
-      slippage: req.query.slippagePercentage / 100,
-      fee: process.env.BITRABO_FEE,  // Your fee
+      fromChainId: Number(params.fromNetworkId.replace('evm--', '')),
+      toChainId: Number(params.toNetworkId.replace('evm--', '')),
+      fromTokenAddress: params.fromTokenAddress || '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+      toTokenAddress: params.toTokenAddress,
+      fromAmount: params.fromTokenAmount,
+      fromAddress: params.userAddress,
+      slippage: Number(params.slippagePercentage) / 100 || 0.005,
     });
 
-    // Format as OneKey expects (IFetchQuoteResult[])
-    const result = [{
-      info: { provider: 'lifi', providerName: 'LI.FI (Bitrabo)' },
-      fromTokenInfo: { contractAddress: quote.fromToken.address, networkId: req.query.fromNetworkId },
-      toTokenInfo: { contractAddress: quote.toToken.address, networkId: req.query.toNetworkId },
-      toAmount: quote.estimate.toAmount,
-      instantRate: quote.estimate.toAmount / req.query.fromTokenAmount,
-      fee: { percentageFee: Number(process.env.BITRABO_FEE) * 100 },
-      isBest: true,
-      // Add more fields as needed
-    }];
+    // Format response like OneKey
+    const result = {
+      code: 0,
+      data: [{
+        info: { provider: 'lifi', providerName: 'LI.FI (Bitrabo)' },
+        fromTokenInfo: { contractAddress: quote.fromToken.address, networkId: params.fromNetworkId },
+        toTokenInfo: { contractAddress: quote.toToken.address, networkId: params.toNetworkId },
+        toAmount: quote.estimate.toAmount,
+        instantRate: new BigNumber(quote.estimate.toAmount).div(params.fromTokenAmount).toString(),
+        fee: { percentageFee: 0.25 },
+        isBest: true,
+        // Add more fields as needed
+      }]
+    };
 
-    res.json({ code: 0, data: result });
+    res.json(result);
   } catch (error) {
-    res.status(500).json({ code: 1, message: error.message });
+    console.error(error);
+    res.status(500).json({ code: 1, message: error.message || 'Quote failed' });
   }
 });
 
-// Health
+// Health check
 app.get('/', (req, res) => res.send('Bitrabo Swap Backend Live!'));
 
 app.listen(PORT, () => console.log(`Bitrabo backend on port ${PORT}`));
