@@ -11,6 +11,7 @@
     "@lifi/sdk": "^3.13.7",
     "dotenv": "^16.4.5",
     "bignumber.js": "^9.1.2",
-    "http-proxy-middleware": "^2.0.6"
+    "http-proxy-middleware": "^2.0.6",
+    "axios": "^1.7.2"
   }
 }
