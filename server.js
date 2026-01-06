@@ -1,342 +1,278 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios');
 const BigNumber = require('bignumber.js');
-const { createProxyMiddleware } = require('http-proxy-middleware');
+const { createConfig, getRoutes, getTokens } = require('@lifi/sdk');
 
-const {
-  createConfig,
-  getRoutes,
-  executeRoute,
-  getTokens,
-} = require('@lifi/sdk');
-
+// --- CONFIGURATION ---
 const app = express();
+const PORT = process.env.PORT || 3000;
 
+// Initialize LiFi SDK
+createConfig({
+  integrator: process.env.BITRABO_INTEGRATOR || 'bitrabo',
+});
+
+// Middleware
 app.use(cors());
 app.use(express.json());
 
-/**
- * ----------------------------------------------------
- * LI.FI global config – Bitrabo as integrator
- * ----------------------------------------------------
- */
-createConfig({
-  integrator: process.env.BITRABO_INTEGRATOR || 'bitrabo',
-  fee: Number(process.env.BITRABO_FEE || 0.0025), // 0.25%
-});
+// --- HELPERS ---
 
-const PORT = process.env.PORT || 3000;
+// 1. OneKey Response Wrapper (Crucial for "Unknown Error" fix)
+const ok = (data) => ({ code: 0, data });
 
-/**
- * OneKey style success wrapper
- */
-function ok(data) {
-  return { code: 0, data };
-}
+// 2. Network ID Parsers (OneKey uses "evm--1", LiFi uses 1)
+const toLiFiChain = (oneKeyId) => {
+  if (!oneKeyId) return 1; // default eth
+  return parseInt(oneKeyId.replace('evm--', ''));
+};
 
-/**
- * Normalize native token address
- */
-function native(addr) {
-  if (!addr) return addr;
+const toOneKeyChain = (lifiId) => `evm--${lifiId}`;
 
-  const N = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
-  return addr.toLowerCase() === N ? N : addr;
-}
-
-/**
- * Convert human amount → BigNumberish smallest units
- */
-function toSmallestUnits(amount, decimals = 18) {
+// 3. Shared Quote Logic (Used by both /quote and /quote/events)
+async function fetchLiFiQuotes(params) {
   try {
-    const bn = new BigNumber(String(amount || '0'));
-    if (bn.lte(0)) return '0';
+    const fromChainId = toLiFiChain(params.fromNetworkId);
+    const toChainId = toLiFiChain(params.toNetworkId);
+    const fromTokenAddress = params.fromTokenAddress || '0x0000000000000000000000000000000000000000';
+    const toTokenAddress = params.toTokenAddress || '0x0000000000000000000000000000000000000000';
+    const slippage = params.slippagePercentage ? Number(params.slippagePercentage) / 100 : 0.005;
 
-    return bn
-      .multipliedBy(new BigNumber(10).pow(decimals))
-      .integerValue(BigNumber.ROUND_FLOOR)
-      .toString();
-  } catch {
-    return '0';
+    // Call LiFi SDK
+    const routesResponse = await getRoutes({
+      fromChainId,
+      toChainId,
+      fromTokenAddress,
+      toTokenAddress,
+      fromAmount: params.fromTokenAmount,
+      fromAddress: params.userAddress,
+      slippage,
+      options: {
+        integrator: process.env.BITRABO_INTEGRATOR || 'bitrabo',
+        fee: Number(process.env.BITRABO_FEE || 0.0025), // 0.25% Application Fee
+      }
+    });
+
+    if (!routesResponse.routes || routesResponse.routes.length === 0) {
+      return [];
+    }
+
+    // Map LiFi Routes to OneKey Quote Structure
+    return routesResponse.routes.map((route, index) => {
+      const isBest = index === 0; // First result is best in LiFi
+      
+      return {
+        info: {
+          provider: 'lifi',
+          providerName: 'Li.Fi (Bitrabo)',
+          providerLogoURI: 'https://raw.githubusercontent.com/lifinance/types/main/src/assets/logo.png'
+        },
+        fromTokenInfo: {
+          networkId: params.fromNetworkId,
+          contractAddress: route.fromToken.address,
+          symbol: route.fromToken.symbol,
+          name: route.fromToken.name,
+          decimals: route.fromToken.decimals,
+          logoURI: route.fromToken.logoURI,
+          isNative: route.fromToken.address === '0x0000000000000000000000000000000000000000'
+        },
+        toTokenInfo: {
+          networkId: params.toNetworkId,
+          contractAddress: route.toToken.address,
+          symbol: route.toToken.symbol,
+          name: route.toToken.name,
+          decimals: route.toToken.decimals,
+          logoURI: route.toToken.logoURI,
+          isNative: route.toToken.address === '0x0000000000000000000000000000000000000000'
+        },
+        fromAmount: route.fromAmount,
+        toAmount: route.toAmount,
+        toAmountMin: route.toAmountMin,
+        instantRate: new BigNumber(route.toAmount).div(route.fromAmount).toString(),
+        
+        // OneKey uses routesData to visualize steps (Approve -> Swap -> Bridge)
+        routesData: route.steps.map(step => ({
+          name: step.toolDetails.name || step.tool,
+          part: 100,
+          subRoutes: [[{
+            name: step.toolDetails.name || step.tool,
+            part: 100
+          }]]
+        })),
+        
+        // CRITICAL: Pass the FULL LiFi route object as context.
+        // We will need this in /build-tx to generate transaction data.
+        quoteResultCtx: route, 
+        
+        kind: 'sell', // usually 'sell' (exact input)
+        receivedBest: isBest,
+        isBest: isBest,
+        fee: {
+          percentageFee: Number(process.env.BITRABO_FEE || 0.0025),
+          feeReceiver: process.env.BITRABO_FEE_RECEIVER
+        },
+        estimatedTime: route.tags?.includes('RECOMMENDED') ? 60 : 120, // Dummy estimation
+      };
+    });
+
+  } catch (error) {
+    console.error("Quote Error:", error.message);
+    return [];
   }
 }
 
-// ====================================================
-// ---------------- NETWORKS --------------------------
-// ====================================================
+// --- ROUTES ---
+
+/**
+ * 1. GET /swap/v1/networks
+ * Returns supported chains formatted for OneKey
+ */
 app.get('/swap/v1/networks', async (req, res) => {
   try {
-    const tokens = await getTokens();
-
-    // Current SDK → array of token objects in tokens.tokens
-    const chainIds = [
-      ...new Set((tokens.tokens || []).map(t => t.chainId)),
-    ];
-
-    const out = chainIds.map(chainId => ({
-      networkId: `evm--${chainId}`,
-      supportSingleSwap: true,
+    const data = await getTokens(); // LiFi getTokens includes chain data
+    const chainIds = Object.keys(data.tokens || {});
+    
+    const networks = chainIds.map(id => ({
+      networkId: toOneKeyChain(id),
+      name: `EVM ${id}`, // Ideally map this to real names if needed
+      shortcode: 'ETH',
+      logoURI: '',
       supportCrossChainSwap: true,
+      supportSingleSwap: true,
       supportLimit: false,
-      defaultSelectToken: [],
+      defaultSelectToken: []
     }));
 
-    res.json(ok(out));
+    res.json(ok(networks));
   } catch (e) {
-    console.error('NETWORK ERROR', e);
     res.json(ok([]));
   }
 });
 
-// ====================================================
-// ---------------- TOKENS ----------------------------
-// ====================================================
+/**
+ * 2. GET /swap/v1/tokens
+ * Returns token list for a specific network
+ */
 app.get('/swap/v1/tokens', async (req, res) => {
   try {
     const { networkId, keywords } = req.query;
+    const lifiChainId = toLiFiChain(networkId);
+    
+    const data = await getTokens({ chains: [lifiChainId] });
+    let tokens = data.tokens[lifiChainId] || [];
 
-    const all = await getTokens();
-
-    let list = all.tokens || [];
-
-    // Filter by chain if provided
-    if (networkId) {
-      const chainId = Number(
-        String(networkId).replace('evm--', ''),
-      );
-      if (chainId) {
-        list = list.filter(t => t.chainId === chainId);
-      }
-    }
-
+    // Filter by keyword if provided
     if (keywords) {
-      const k = String(keywords).toLowerCase();
-      list = list.filter(t =>
-        String(t.symbol).toLowerCase().includes(k) ||
-        String(t.name).toLowerCase().includes(k),
+      const lowerK = keywords.toLowerCase();
+      tokens = tokens.filter(t => 
+        t.name.toLowerCase().includes(lowerK) || 
+        t.symbol.toLowerCase().includes(lowerK)
       );
     }
 
-    const mapped = list.slice(0, 50).map(t => ({
+    const mappedTokens = tokens.slice(0, 100).map(t => ({
       name: t.name,
       symbol: t.symbol,
       decimals: t.decimals,
+      contractAddress: t.address,
       logoURI: t.logoURI,
-      contractAddress: native(t.address || t.address),
-      networkId: `evm--${t.chainId}`,
-      reservationValue: '0',
-      price: '0',
+      networkId: networkId,
+      isNative: t.address === '0x0000000000000000000000000000000000000000',
+      price: t.priceUSD || '0'
     }));
 
-    res.json(ok(mapped));
+    res.json(ok(mappedTokens));
   } catch (e) {
-    console.error('TOKEN ERROR', e);
     res.json(ok([]));
   }
 });
 
-// ====================================================
-// ---------------- QUOTE -----------------------------
-// ====================================================
+/**
+ * 3. GET /swap/v1/quote
+ * Standard fetch for quotes (non-streaming)
+ */
 app.get('/swap/v1/quote', async (req, res) => {
-  try {
-    const p = req.query;
-
-    const fromChainId = Number(
-      String(p.fromNetworkId || '').replace('evm--', ''),
-    );
-    const toChainId = Number(
-      String(p.toNetworkId || '').replace('evm--', ''),
-    );
-
-    // ---- strict guards so we don’t silently cancel ----
-    if (
-      !fromChainId ||
-      !toChainId ||
-      !p.fromTokenAmount ||
-      !p.toTokenAddress
-    ) {
-      return res.json(ok([]));
-    }
-
-    const decimals =
-      Number(p.fromTokenDecimals) ||
-      Number(p.fromTokenDecimals) ||
-      18;
-
-    const smallest = toSmallestUnits(
-      p.fromTokenAmount,
-      decimals,
-    );
-
-    if (smallest === '0') {
-      return res.json(ok([]));
-    }
-
-    const routes = await getRoutes({
-      fromChainId,
-      toChainId,
-
-      fromTokenAddress:
-        native(p.fromTokenAddress) ||
-        '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
-
-      toTokenAddress: native(p.toTokenAddress),
-
-      fromAmount: smallest,          // ✅ BigNumberish
-      fromAddress: p.userAddress,    // optional
-      slippage:
-        Number(p.slippagePercentage) / 100 || 0.005,
-    });
-
-    if (!routes.routes?.length) {
-      return res.json(ok([]));
-    }
-
-    const best = routes.routes[0];
-
-    const quote = {
-      info: {
-        provider: 'lifi',
-        providerName: 'LI.FI (Bitrabo)',
-      },
-
-      fromTokenInfo: {
-        contractAddress: native(best.fromToken.address),
-        networkId: p.fromNetworkId,
-        decimals: best.fromToken.decimals,
-        symbol: best.fromToken.symbol,
-        name: best.fromToken.name,
-      },
-
-      toTokenInfo: {
-        contractAddress: native(best.toToken.address),
-        networkId: p.toNetworkId,
-        decimals: best.toToken.decimals,
-        symbol: best.toToken.symbol,
-        name: best.toToken.name,
-      },
-
-      fromAmount: best.fromAmount,
-      toAmount: best.toAmount,
-      toAmountMin: best.toAmountMin,
-
-      instantRate: new BigNumber(best.toAmount)
-        .div(best.fromAmount)
-        .toString(),
-
-      fee: {
-        percentageFee: Number(
-          process.env.BITRABO_FEE || 0.0025,
-        ),
-        feeReceiver: process.env.BITRABO_FEE_RECEIVER,
-      },
-
-      isBest: true,
-      receivedBest: true,
-
-      estimatedTime:
-        best.estimate?.etaSeconds || 180,
-
-      allowanceResult: { isApproved: true },
-
-      routesData: (best.steps || []).map(s => ({
-        name:
-          s.toolDetails?.name || s.tool,
-        part: 100,
-        subRoutes: [],
-      })),
-
-      kind: 'sell',
-      quoteResultCtx: best,
-
-      quoteExtraData: {},
-    };
-
-    res.json(ok([quote]));
-  } catch (e) {
-    console.error('LI.FI QUOTE ERROR', e);
-    res.json(ok([]));
-  }
+  const quotes = await fetchLiFiQuotes(req.query);
+  res.json(ok(quotes));
 });
 
-// ====================================================
-// ---------------- BUILD TX --------------------------
-// ====================================================
-app.post('/swap/v1/build-tx', async (req, res) => {
-  try {
-    const { quoteResultCtx } = req.body;
-
-    if (!quoteResultCtx) {
-      return res.status(400).json(ok(null));
-    }
-
-    const execution = await executeRoute({
-      route: quoteResultCtx,
-    });
-
-    res.json(
-      ok({
-        result: {
-          info: {
-            provider: 'lifi',
-            providerName: 'Bitrabo',
-          },
-        },
-        tx: execution.transactionRequest,
-        raw: execution,
-      }),
-    );
-  } catch (e) {
-    console.error('BUILD TX ERROR', e);
-    res.json(ok(null));
-  }
-});
-
-// ====================================================
-// ---------------- SSE EVENTS ------------------------
-// ====================================================
+/**
+ * 4. GET /swap/v1/quote/events
+ * Server-Sent Events (SSE) for real-time quoting
+ */
 app.get('/swap/v1/quote/events', async (req, res) => {
+  // Set headers for SSE
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
   try {
-    const quotes = await axios.get(
-      `http://127.0.0.1:${PORT}/swap/v1/quote`,
-      { params: req.query },
-    );
-
-    res.setHeader(
-      'Content-Type',
-      'text/event-stream',
-    );
-    res.setHeader(
-      'Cache-Control',
-      'no-cache',
-    );
-
-    res.write(
-      `data: ${JSON.stringify(quotes.data)}\n\n`,
-    );
-    res.write('data: {"type":"done"}\n\n');
+    const quotes = await fetchLiFiQuotes(req.query);
+    
+    // Send data in SSE format: data: JSONString\n\n
+    res.write(`data: ${JSON.stringify(quotes)}\n\n`);
+    
+    // Send "done" event to close the stream on frontend
+    res.write(`data: {"type":"done"}\n\n`);
   } catch (e) {
-    console.error('SSE ERROR', e);
-    res.write('data: {"type":"error"}\n\n');
+    console.error("SSE Error", e);
+    res.write(`data: {"type":"error", "message": "Failed to fetch quotes"}\n\n`);
   } finally {
     res.end();
   }
 });
 
-// ====================================================
-// ---------------- PROXY FALLBACK --------------------
-// ====================================================
-app.use(
-  '/swap/v1',
-  createProxyMiddleware({
-    target: 'https://swap.onekeycn.com',
-    changeOrigin: true,
-  }),
-);
+/**
+ * 5. POST /swap/v1/build-tx
+ * Generates the UNSIGNED transaction data
+ */
+app.post('/swap/v1/build-tx', async (req, res) => {
+  try {
+    // quoteResultCtx is the raw LiFi route object we saved in the quote step
+    const { quoteResultCtx, userAddress } = req.body;
 
+    if (!quoteResultCtx) {
+      return res.json({ code: 500, message: "Missing quote context" });
+    }
+
+    // In LiFi, the first step contains the immediate transaction info needed
+    // for the user to sign (e.g., Approve Token or Swap).
+    const step = quoteResultCtx.steps[0];
+    const txRequest = step.transactionRequest;
+
+    if (!txRequest) {
+      // If transactionRequest is missing, we might need to fetch it (rare for single swap)
+      return res.json({ code: 500, message: "Could not generate transaction data" });
+    }
+
+    // Map to OneKey BuildTx Response
+    const buildTxResponse = {
+      result: {
+        info: {
+          provider: 'lifi',
+          providerName: 'Li.Fi (Bitrabo)'
+        }
+      },
+      // This is the RAW transaction OneKey will sign
+      tx: {
+        to: txRequest.to,
+        value: txRequest.value ? new BigNumber(txRequest.value).toFixed() : '0',
+        data: txRequest.data,
+        gas: txRequest.gasLimit ? new BigNumber(txRequest.gasLimit).toFixed() : undefined, // Optional
+        from: userAddress
+      }
+    };
+
+    res.json(ok(buildTxResponse));
+
+  } catch (e) {
+    console.error("Build Tx Error:", e);
+    res.json({ code: 500, message: e.message });
+  }
+});
+
+// Start Server
 app.listen(PORT, () => {
-  console.log('Bitrabo Aggregator Running');
+  console.log(`Bitrabo Swap Backend running on port ${PORT}`);
 });
