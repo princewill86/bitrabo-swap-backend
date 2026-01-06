@@ -1,62 +1,45 @@
+// server.js
 require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
-const { createConfig } = require('@lifi/sdk');
-const { getQuote } = require('@lifi/sdk');
-const BigNumber = require('bignumber.js');
+const { createProxyMiddleware } = require('http-proxy-middleware');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
-
-// Correct v3+ init
-createConfig({
-  integrator: process.env.BITRABO_INTEGRATOR || 'bitrabo',
-});
-
 const PORT = process.env.PORT || 3000;
 
-// Exact path from your trace
-app.get('/swap/v1/quote/events', async (req, res) => {
-  // For now, redirect to regular quote (events is SSE streaming — add later)
-  res.redirect('/swap/v1/quote?' + new URLSearchParams(req.query).toString());
+// Middleware to parse JSON bodies (needed for POST requests like build-tx)
+app.use(express.json());
+
+// Forward ALL /swap/v1/* requests to OneKey's real swap backend
+app.use(
+  '/swap/v1',
+  createProxyMiddleware({
+    target: 'https://swap.onekeycn.com',     // OneKey's actual swap server
+    changeOrigin: true,
+    pathRewrite: {
+      '^/swap/v1': '/v1',                    // Strip "/swap" → /v1/quote becomes correct
+    },
+    onProxyReq: (proxyReq, req, res) => {
+      // Optional: Log requests for debugging
+      console.log(`Proxying ${req.method} ${req.url}`);
+    },
+    onError: (err, req, res) => {
+      console.error('Proxy error:', err);
+      res.status(500).json({ code: 1, message: 'Proxy error, please try again' });
+    },
+  })
+);
+
+// Health check endpoint — important for Render
+app.get('/', (req, res) => {
+  res.send('Bitrabo Swap Proxy is Live and Ready! 🚀');
 });
 
-// Regular quote (main endpoint)
-app.get('/swap/v1/quote', async (req, res) => {
-  try {
-    const params = req.query;
-
-    const quote = await getQuote({
-      fromChainId: Number(params.fromNetworkId.replace('evm--', '')),
-      toChainId: Number(params.toNetworkId.replace('evm--', '')),
-      fromTokenAddress: params.fromTokenAddress || '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
-      toTokenAddress: params.toTokenAddress,
-      fromAmount: params.fromTokenAmount,
-      fromAddress: params.userAddress,
-      slippage: Number(params.slippagePercentage) / 100 || 0.005,
-    });
-
-    const result = {
-      code: 0,
-      data: [{
-        info: { provider: 'lifi', providerName: 'LI.FI (Bitrabo)' },
-        fromTokenInfo: { contractAddress: quote.fromToken.address, networkId: params.fromNetworkId },
-        toTokenInfo: { contractAddress: quote.toToken.address, networkId: params.toNetworkId },
-        toAmount: quote.estimate.toAmount,
-        instantRate: new BigNumber(quote.estimate.toAmount).dividedBy(params.fromTokenAmount).toString(),
-        fee: { percentageFee: 0.25 },
-        isBest: true,
-      }]
-    };
-
-    res.json(result);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ code: 1, message: 'Quote failed' });
-  }
+// Catch-all for any other routes (optional, helps debugging)
+app.use('*', (req, res) => {
+  res.status(404).json({ code: 404, message: 'Endpoint not found on proxy' });
 });
 
-app.get('/', (req, res) => res.send('Bitrabo Swap Backend Live!'));
-
-app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Bitrabo Swap Proxy running on port ${PORT}`);
+  console.log(`Health check: https://your-proxy.onrender.com/`);
+});
