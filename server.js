@@ -9,30 +9,34 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Initialize LI.FI SDK config (required once)
+// Correct v3+ init
 createConfig({
   integrator: process.env.BITRABO_INTEGRATOR || 'bitrabo',
 });
 
 const PORT = process.env.PORT || 3000;
 
-// /v1/quote endpoint
-app.get('/v1/quote', async (req, res) => {
+// Exact path from your trace
+app.get('/swap/v1/quote/events', async (req, res) => {
+  // For now, redirect to regular quote (events is SSE streaming — add later)
+  res.redirect('/swap/v1/quote?' + new URLSearchParams(req.query).toString());
+});
+
+// Regular quote (main endpoint)
+app.get('/swap/v1/quote', async (req, res) => {
   try {
     const params = req.query;
 
-    // Call getQuote directly (no instance needed)
     const quote = await getQuote({
       fromChainId: Number(params.fromNetworkId.replace('evm--', '')),
       toChainId: Number(params.toNetworkId.replace('evm--', '')),
-      fromTokenAddress: params.fromTokenAddress || '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',  // Native token
+      fromTokenAddress: params.fromTokenAddress || '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
       toTokenAddress: params.toTokenAddress,
       fromAmount: params.fromTokenAmount,
       fromAddress: params.userAddress,
       slippage: Number(params.slippagePercentage) / 100 || 0.005,
     });
 
-    // Simple response (mirrors OneKey structure)
     const result = {
       code: 0,
       data: [{
@@ -41,19 +45,18 @@ app.get('/v1/quote', async (req, res) => {
         toTokenInfo: { contractAddress: quote.toToken.address, networkId: params.toNetworkId },
         toAmount: quote.estimate.toAmount,
         instantRate: new BigNumber(quote.estimate.toAmount).dividedBy(params.fromTokenAmount).toString(),
-        fee: { percentageFee: 0.25 },  // Your fee (LI.FI deducts it)
+        fee: { percentageFee: 0.25 },
         isBest: true,
       }]
     };
 
     res.json(result);
   } catch (error) {
-    console.error('Quote error:', error);
-    res.status(500).json({ code: 1, message: error.message || 'Failed to get quote' });
+    console.error(error);
+    res.status(500).json({ code: 1, message: 'Quote failed' });
   }
 });
 
-// Health check
 app.get('/', (req, res) => res.send('Bitrabo Swap Backend Live!'));
 
-app.listen(PORT, () => console.log(`Bitrabo backend running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
