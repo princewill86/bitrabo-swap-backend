@@ -26,10 +26,19 @@ createConfig({
 const PORT = process.env.PORT || 3000;
 
 /**
- * Utility wrapper – EXACT OneKey style
+ * OneKey style wrapper
  */
 function ok(data) {
   return { code: 0, data };
+}
+
+/**
+ * Normalize native token address
+ */
+function native(addr) {
+  return addr && addr.toLowerCase() === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+    ? '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+    : addr;
 }
 
 // ---------------- NETWORKS ----------------
@@ -37,17 +46,14 @@ app.get('/swap/v1/networks', async (req, res) => {
   try {
     const tokens = await getTokens();
 
-    const networkIds = [
-      ...new Set((tokens.tokens || []).map(t => t.chainId)),
-    ];
+    const chainIds = Object.keys(tokens.tokens || {});
 
-    const out = networkIds.map(chainId => ({
+    const out = chainIds.map(chainId => ({
       networkId: `evm--${chainId}`,
       supportSingleSwap: true,
       supportCrossChainSwap: true,
       supportLimit: false,
-      // placeholder until you define your defaults
-      defaultSelectToken: [],
+      defaultSelectToken: [],   // you define later
     }));
 
     res.json(ok(out));
@@ -65,20 +71,24 @@ app.get('/swap/v1/tokens', async (req, res) => {
     const all = await getTokens();
 
     const chainId = networkId
-      ? Number(String(networkId).replace('evm--', ''))
-      : undefined;
+      ? String(networkId).replace('evm--', '')
+      : null;
 
-    let list = all.tokens || [];
+    let list = [];
 
-    if (chainId) {
-      list = list.filter(t => t.chainId === chainId);
+    // Flatten selected chain
+    if (chainId && all.tokens?.[chainId]) {
+      list = all.tokens[chainId];
+    } else {
+      // Flatten all chains
+      list = Object.values(all.tokens || {}).flat();
     }
 
     if (keywords) {
       const k = String(keywords).toLowerCase();
       list = list.filter(t =>
-        t.symbol.toLowerCase().includes(k) ||
-        t.name.toLowerCase().includes(k),
+        String(t.symbol).toLowerCase().includes(k) ||
+        String(t.name).toLowerCase().includes(k),
       );
     }
 
@@ -87,7 +97,7 @@ app.get('/swap/v1/tokens', async (req, res) => {
       symbol: t.symbol,
       decimals: t.decimals,
       logoURI: t.logoURI,
-      contractAddress: t.address,
+      contractAddress: native(t.address),
       networkId: `evm--${t.chainId}`,
       reservationValue: '0',
       price: '0',
@@ -139,7 +149,7 @@ app.get('/swap/v1/quote', async (req, res) => {
       },
 
       fromTokenInfo: {
-        contractAddress: best.fromToken.address,
+        contractAddress: native(best.fromToken.address),
         networkId: p.fromNetworkId,
         decimals: best.fromToken.decimals,
         symbol: best.fromToken.symbol,
@@ -147,7 +157,7 @@ app.get('/swap/v1/quote', async (req, res) => {
       },
 
       toTokenInfo: {
-        contractAddress: best.toToken.address,
+        contractAddress: native(best.toToken.address),
         networkId: p.toNetworkId,
         decimals: best.toToken.decimals,
         symbol: best.toToken.symbol,
@@ -196,6 +206,10 @@ app.post('/swap/v1/build-tx', async (req, res) => {
   try {
     const { quoteResultCtx } = req.body;
 
+    if (!quoteResultCtx) {
+      return res.status(400).json(ok(null));
+    }
+
     const execution = await executeRoute({
       route: quoteResultCtx,
     });
@@ -216,7 +230,7 @@ app.post('/swap/v1/build-tx', async (req, res) => {
 // ---------------- SSE EVENTS ----------------
 app.get('/swap/v1/quote/events', async (req, res) => {
   try {
-    // call internal quote endpoint using Render style
+    // Render can call itself only via 127.0.0.1 in same instance
     const quotes = await axios.get(
       `http://127.0.0.1:${PORT}/swap/v1/quote`,
       { params: req.query },
@@ -234,6 +248,12 @@ app.get('/swap/v1/quote/events', async (req, res) => {
     res.end();
   }
 });
+
+// Proxy fallback endpoints
+app.use('/swap/v1', createProxyMiddleware({
+  target: 'https://swap.onekeycn.com',
+  changeOrigin: true,
+}));
 
 app.listen(PORT, () => {
   console.log('Bitrabo Aggregator Running');
