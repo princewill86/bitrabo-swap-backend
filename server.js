@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { LiFi } = require('@li.fi/sdk');
+const { LiFi } = require('@lifi/sdk');
 
 const app = express();
 app.use(cors());
