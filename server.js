@@ -35,11 +35,10 @@ function ok(data) {
 // ---------------- NETWORKS ----------------
 app.get('/swap/v1/networks', async (req, res) => {
   try {
-    // You decide supported networks from LI.FI
     const tokens = await getTokens();
 
     const networkIds = [
-      ...new Set(tokens.tokens.map(t => t.chainId)),
+      ...new Set((tokens.tokens || []).map(t => t.chainId)),
     ];
 
     const out = networkIds.map(chainId => ({
@@ -47,7 +46,8 @@ app.get('/swap/v1/networks', async (req, res) => {
       supportSingleSwap: true,
       supportCrossChainSwap: true,
       supportLimit: false,
-      defaultSelectToken: swapDefaultSetTokens,
+      // placeholder until you define your defaults
+      defaultSelectToken: [],
     }));
 
     res.json(ok(out));
@@ -65,10 +65,10 @@ app.get('/swap/v1/tokens', async (req, res) => {
     const all = await getTokens();
 
     const chainId = networkId
-      ? Number(String(networkId).replace('evm--',''))
+      ? Number(String(networkId).replace('evm--', ''))
       : undefined;
 
-    let list = all.tokens;
+    let list = all.tokens || [];
 
     if (chainId) {
       list = list.filter(t => t.chainId === chainId);
@@ -78,7 +78,7 @@ app.get('/swap/v1/tokens', async (req, res) => {
       const k = String(keywords).toLowerCase();
       list = list.filter(t =>
         t.symbol.toLowerCase().includes(k) ||
-        t.name.toLowerCase().includes(k)
+        t.name.toLowerCase().includes(k),
       );
     }
 
@@ -98,7 +98,7 @@ app.get('/swap/v1/tokens', async (req, res) => {
     console.error(e);
     res.json(ok([]));
   }
-}
+});
 
 // ---------------- QUOTE ----------------
 app.get('/swap/v1/quote', async (req, res) => {
@@ -106,10 +106,10 @@ app.get('/swap/v1/quote', async (req, res) => {
     const p = req.query;
 
     const fromChainId = Number(
-      String(p.fromNetworkId).replace('evm--','')
+      String(p.fromNetworkId || '').replace('evm--', ''),
     );
     const toChainId = Number(
-      String(p.toNetworkId).replace('evm--','')
+      String(p.toNetworkId || '').replace('evm--', ''),
     );
 
     const routes = await getRoutes({
@@ -132,7 +132,6 @@ app.get('/swap/v1/quote', async (req, res) => {
 
     const best = routes.routes[0];
 
-    // -------- mapper to EXACT OneKey fields --------
     const quote = {
       info: {
         provider: 'lifi',
@@ -217,17 +216,19 @@ app.post('/swap/v1/build-tx', async (req, res) => {
 // ---------------- SSE EVENTS ----------------
 app.get('/swap/v1/quote/events', async (req, res) => {
   try {
+    // call internal quote endpoint using Render style
     const quotes = await axios.get(
-      `http://localhost:${PORT}/swap/v1/quote`,
+      `http://127.0.0.1:${PORT}/swap/v1/quote`,
       { params: req.query },
     );
 
-    res.setHeader('Content-Type','text/event-stream');
-    res.setHeader('Cache-Control','no-cache');
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
 
     res.write(`data: ${JSON.stringify(quotes.data)}\n\n`);
     res.write('data: {"type":"done"}\n\n');
   } catch (e) {
+    console.error(e);
     res.write('data: {"type":"error"}\n\n');
   } finally {
     res.end();
