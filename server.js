@@ -85,6 +85,12 @@ app.use('/swap/v1', createProxyMiddleware({
   },
 }));
 
+// Log ALL requests (even non-swap)
+app.use('*', (req, res, next) => {
+  console.log(`ALL → ${req.method} ${req.url}`);
+  next();
+});
+
 app.listen(PORT, () => {
   console.log(`Bitrabo Backend Live on port ${PORT}`);
   console.log('Your LI.FI quotes shown + full compatibility');
