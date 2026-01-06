@@ -232,7 +232,6 @@ app.post('/swap/v1/build-tx', async (req, res) => {
 // ---------------- SSE EVENTS ----------------
 app.get('/swap/v1/quote/events', async (req, res) => {
   try {
-    // Render can call itself only via 127.0.0.1 in same instance
     const quotes = await axios.get(
       `http://127.0.0.1:${PORT}/swap/v1/quote`,
       { params: req.query },
@@ -251,7 +250,7 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   }
 });
 
-// Proxy fallback endpoints
+// ---------------- PROXY FALLBACK ----------------
 app.use('/swap/v1', createProxyMiddleware({
   target: 'https://swap.onekeycn.com',
   changeOrigin: true,
