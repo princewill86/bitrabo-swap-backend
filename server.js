@@ -3,12 +3,13 @@ const express = require('express');
 const cors = require('cors');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const BigNumber = require('bignumber.js');
-const { createConfig, getRoutes, getTokens } = require('@lifi/sdk');
+const { ethers } = require('ethers'); // Ensure ethers is installed
+const { createConfig, getRoutes, getToken } = require('@lifi/sdk');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- CONFIGURATION ---
+// --- CONFIG ---
 createConfig({
   integrator: process.env.BITRABO_INTEGRATOR || 'bitrabo',
   fee: Number(process.env.BITRABO_FEE || 0.0025),
@@ -16,38 +17,73 @@ createConfig({
 
 app.use(cors({ origin: '*' }));
 
-// We need a separate JSON parser for our hijacked routes, 
-// BUT we must not parse the Proxy routes (proxy needs raw stream)
-const jsonParser = express.json();
-
 // --- LOGGING ---
 app.use((req, res, next) => {
-  // Only log interesting endpoints to keep logs clean
-  if(req.url.includes('quote') || req.url.includes('build')) {
-    console.log(`[⚡ HIJACK] ${req.method} ${req.url}`);
-  } else {
-    console.log(`[🔄 PROXY] ${req.method} ${req.url}`);
-  }
+  // Simple visual check to see what is being hijacked vs proxied
+  const isHijack = req.url.includes('quote') || req.url.includes('providers') || req.url.includes('build-tx');
+  console.log(isHijack ? `[⚡ HIJACK] ${req.method} ${req.url}` : `[🔄 PROXY] ${req.method} ${req.url}`);
   next();
 });
 
-// ==================================================================
-// 1. THE HIJACKED ROUTES (Your Fees & Logic)
-// ==================================================================
-
-// Helper to format response like OneKey
+// JSON Parser (Only for non-proxy routes)
+const jsonParser = express.json();
 const ok = (data) => ({ code: 0, data });
 
-// --- QUOTE LOGIC (Shared) ---
+// ==================================================================
+// 1. CRITICAL HIJACKS (Must be defined BEFORE the Proxy)
+// ==================================================================
+
+// FIX #1: Force the Provider List. 
+// We use regex to ensure we catch it even if there are query params.
+app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
+  res.json(ok([{
+    provider: 'lifi',
+    name: 'Bitrabo',
+    logoURI: 'https://raw.githubusercontent.com/lifinance/types/main/src/assets/logo.png',
+    status: 'available',
+    priority: 1
+  }]));
+});
+
+// FIX #2: Helper to fix the "0.0011" Amount Error
+async function normalizeAmount(chainId, tokenAddress, rawAmount) {
+  // If it doesn't contain a dot, it's likely already Wei (Integer)
+  if (!rawAmount || !rawAmount.includes('.')) return rawAmount;
+
+  try {
+    // If native token (empty address), we know it's 18 decimals
+    if (!tokenAddress || tokenAddress === '' || tokenAddress === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee') {
+      return ethers.parseUnits(rawAmount, 18).toString();
+    }
+    
+    // For other tokens, we must fetch decimals to convert correctly
+    // (e.g. USDC is 6 decimals, not 18)
+    const token = await getToken(chainId, tokenAddress);
+    if (token && token.decimals) {
+      // safe conversion limits to avoid "too many decimal points" error
+      const safeAmount = Number(rawAmount).toFixed(token.decimals);
+      return ethers.parseUnits(safeAmount, token.decimals).toString();
+    }
+    
+    // Fallback if token fetch fails (assume 18)
+    return ethers.parseUnits(rawAmount, 18).toString();
+  } catch (e) {
+    console.error("Amount Normalization Failed:", e);
+    return rawAmount; // Try passing raw as last resort
+  }
+}
+
+// --- QUOTE LOGIC ---
 async function fetchLiFiQuotes(params) {
   try {
     const fromChain = parseInt(params.fromNetworkId.replace('evm--', ''));
     const toChain = parseInt(params.toNetworkId.replace('evm--', ''));
     const fromToken = params.fromTokenAddress || '0x0000000000000000000000000000000000000000';
     const toToken = params.toTokenAddress || '0x0000000000000000000000000000000000000000';
-    const amount = params.fromTokenAmount;
     
-    // Quick validation
+    // Apply Fix #2
+    const amount = await normalizeAmount(fromChain, fromToken, params.fromTokenAmount);
+    
     if(!amount || amount === '0') return [];
 
     const routesResponse = await getRoutes({
@@ -66,13 +102,11 @@ async function fetchLiFiQuotes(params) {
 
     if (!routesResponse.routes || routesResponse.routes.length === 0) return [];
 
-    // Map LiFi result to OneKey structure
-    // This structure matches what "ServiceSwap.ts" expects
     return routesResponse.routes.map((route, i) => {
       const isBest = i === 0;
       return {
         info: {
-          provider: 'lifi', // Must match the ID in providers/list
+          provider: 'lifi', 
           providerName: 'Bitrabo',
           providerLogoURI: 'https://raw.githubusercontent.com/lifinance/types/main/src/assets/logo.png',
         },
@@ -96,14 +130,8 @@ async function fetchLiFiQuotes(params) {
         kind: 'sell',
         isBest: isBest,
         receivedBest: isBest,
-        
-        // IMPORTANT: Passing the raw route so we can build tx later
         quoteResultCtx: route, 
-        
-        // IMPORTANT: Fake the approval so the button says "Swap" initially.
-        // If approval is actually needed, the build-tx step handles it in LiFi
-        allowanceResult: { isApproved: true },
-
+        allowanceResult: { isApproved: true }, // Assume approved, let build-tx handle perms
         routesData: route.steps.map(s => ({
             name: s.toolDetails.name,
             part: 100,
@@ -121,13 +149,7 @@ async function fetchLiFiQuotes(params) {
   }
 }
 
-// Intercept Standard Quote
-app.get('/swap/v1/quote', async (req, res) => {
-  const quotes = await fetchLiFiQuotes(req.query);
-  res.json(ok(quotes));
-});
-
-// Intercept SSE Quote (The one causing "No Provider" usually)
+// SSE Endpoint (Hijack)
 app.get('/swap/v1/quote/events', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -136,7 +158,6 @@ app.get('/swap/v1/quote/events', async (req, res) => {
 
   try {
     const quotes = await fetchLiFiQuotes(req.query);
-    // Send the data exactly how EventSource expects it
     res.write(`data: ${JSON.stringify(quotes)}\n\n`);
     res.write(`data: {"type":"done"}\n\n`);
   } catch (e) {
@@ -146,7 +167,7 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   }
 });
 
-// Intercept Build Transaction
+// Build Tx Endpoint (Hijack)
 app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
   try {
     const { quoteResultCtx, userAddress } = req.body;
@@ -173,29 +194,19 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
   }
 });
 
-// Force our Provider into the list
-app.get('/swap/v1/providers/list', (req, res) => {
-  res.json(ok([{
-    provider: 'lifi', // This ID matches the quote response
-    name: 'Bitrabo',
-    logoURI: 'https://raw.githubusercontent.com/lifinance/types/main/src/assets/logo.png',
-    status: 'available',
-    priority: 1
-  }]));
-});
-
 // ==================================================================
-// 2. THE PROXY ROUTES (Balances, History, etc.)
+// 2. PROXY FALLBACK (Everything else goes to OneKey)
 // ==================================================================
-
-// Everything NOT matched above goes to OneKey's real server.
-// This fixes your "Wallet amount doesn't display" error.
 app.use('/swap/v1', createProxyMiddleware({
   target: 'https://swap.onekeycn.com',
   changeOrigin: true,
-  logLevel: 'silent' 
+  logLevel: 'silent',
+  // Ensure we don't double-proxy the hijacked routes if something slips through
+  filter: (pathname, req) => {
+    return !pathname.includes('providers/list') && !pathname.includes('quote') && !pathname.includes('build-tx');
+  }
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo Hybrid Server Running on ${PORT}`);
+  console.log(`Bitrabo Hybrid Server v7 Running on ${PORT}`);
 });
