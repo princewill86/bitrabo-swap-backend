@@ -10,7 +10,9 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// CONFIG
 const INTEGRATOR = process.env.BITRABO_INTEGRATOR || 'bitrabo';
+const FEE_RECEIVER = process.env.BITRABO_FEE_RECEIVER; 
 const FEE_PERCENT = Number(process.env.BITRABO_FEE || 0.0025); 
 
 createConfig({
@@ -69,7 +71,7 @@ async function formatAmountOutput(chainId, tokenAddress, amountWei) {
     return ethers.formatUnits(amountWei, decimals).toString();
 }
 
-// REAL QUOTE LOGIC
+// REAL QUOTE LOGIC - REWRITTEN FOR PRECISION
 async function fetchLiFiQuotes(params) {
   try {
     const fromChain = parseInt(params.fromNetworkId.replace('evm--', ''));
@@ -94,17 +96,25 @@ async function fetchLiFiQuotes(params) {
       options: {
         integrator: INTEGRATOR,
         fee: FEE_PERCENT,
+        referrer: FEE_RECEIVER 
       }
     });
 
     if (!routesResponse.routes || routesResponse.routes.length === 0) return [];
 
     return await Promise.all(routesResponse.routes.map(async (route, i) => {
-      const fromAmountDecimal = await formatAmountOutput(fromChain, route.fromToken.address, route.fromAmount);
+      // 1. Get Exact Amounts
+      const fromAmountDecimal = params.fromTokenAmount; // ECHO INPUT EXACTLY
       const toAmountDecimal = await formatAmountOutput(toChain, route.toToken.address, route.toAmount);
-      const minToAmountDecimal = (parseFloat(toAmountDecimal) * 0.995).toString();
+      
+      // 2. Strict Math for Min Amount (No floating point errors)
+      const toAmountBN = new BigNumber(toAmountDecimal);
+      const minToAmountDecimal = toAmountBN.multipliedBy(0.995).toString(); // 0.5% slippage safety buffer
+      
+      // 3. Strict Math for Rate
+      const rate = toAmountBN.dividedBy(fromAmountDecimal).toString();
 
-      if (i===0) console.log(`[✅ QUOTE] ${params.fromTokenAmount} -> ${toAmountDecimal}`);
+      if (i===0) console.log(`[✅ QUOTE] ${fromAmountDecimal} -> ${toAmountDecimal}`);
 
       const fromTokenInfo = {
         contractAddress: isNativeSell ? '' : route.fromToken.address,
@@ -136,35 +146,33 @@ async function fetchLiFiQuotes(params) {
         toTokenInfo,
         protocol: 'Swap',
         kind: 'sell',
-        fromAmount: params.fromTokenAmount, // Echo input strictly
+        fromAmount: fromAmountDecimal,
         toAmount: toAmountDecimal,
         minToAmount: minToAmountDecimal,
-        instantRate: new BigNumber(toAmountDecimal).div(params.fromTokenAmount).toString(),
+        instantRate: rate,
         estimatedTime: 30,
         
         quoteResultCtx: { 
             lifiQuoteResultCtx: route,
             fromTokenInfo,
             toTokenInfo,
-            fromAmount: params.fromTokenAmount,
+            fromAmount: fromAmountDecimal,
             toAmount: toAmountDecimal,
-            instantRate: new BigNumber(toAmountDecimal).div(params.fromTokenAmount).toString()
+            instantRate: rate
         }, 
         
         fee: {
-          percentageFee: FEE_PERCENT * 100,
-          estimatedFeeFiatValue: 0.1 
+          percentageFee: FEE_PERCENT * 100 // Display 0.25%
         },
         
-        // --- STRICT FIX: Matching v25 Mock Structure ---
-        // Using "part" (Number) instead of "percent" (String)
+        // --- STRICT MOCK STRUCTURE ---
         routesData: [{
             name: "Li.Fi",
-            part: 100, 
+            part: 100,
             subRoutes: [[{ name: "Li.Fi", part: 100, logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]]
         }],
         
-        oneKeyFeeExtraInfo: {}, // Keep empty to match working mock
+        oneKeyFeeExtraInfo: {},
         allowanceResult: null, 
         gasLimit: 500000,
         supportUrl: "https://help.onekey.so/hc/requests/new",
@@ -217,7 +225,6 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   }
 });
 
-// REAL BUILD-TX (Matching Golden Key Structure + Real Data)
 app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
   try {
     const { quoteResultCtx, userAddress } = req.body;
@@ -243,8 +250,6 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
             instantRate: quoteResultCtx.instantRate,
             estimatedTime: 30,
             fee: { percentageFee: FEE_PERCENT * 100 }, 
-            
-            // --- STRICT MATCH to WORKING MOCK ---
             routesData: [{
                 name: "Li.Fi",
                 part: 100,
@@ -284,5 +289,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo PRODUCTION Server v35 Running on ${PORT}`);
+  console.log(`Bitrabo PRODUCTION Server v36 Running on ${PORT}`);
 });
