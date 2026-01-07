@@ -66,13 +66,8 @@ async function fetchMockQuotes(params) {
 
     console.log(`[⚠️ MOCK CALC] ${fromAmountRaw} ${isNativeSell ? 'ETH' : 'TOKEN'} -> ${toAmountRaw}`);
 
-    const quote = {
-      info: {
-        provider: 'SwapLifi',
-        providerLogo: 'https://uni.onekey-asset.com/static/logo/lifi.png',
-        providerName: 'Li.fi (Bitrabo)',
-      },
-      fromTokenInfo: {
+    // Construct Token Info Objects
+    const fromTokenInfo = {
         contractAddress: isNativeSell ? '' : fromToken,
         networkId: params.fromNetworkId,
         isNative: isNativeSell,
@@ -80,8 +75,9 @@ async function fetchMockQuotes(params) {
         name: isNativeSell ? "Ethereum" : "Tether USD",
         symbol: isNativeSell ? "ETH" : "USDT",
         logoURI: "https://uni.onekey-asset.com/static/chain/eth.png"
-      },
-      toTokenInfo: {
+    };
+
+    const toTokenInfo = {
         contractAddress: isNativeSell ? toToken : '',
         networkId: params.toNetworkId,
         isNative: !isNativeSell,
@@ -89,7 +85,16 @@ async function fetchMockQuotes(params) {
         name: isNativeSell ? "USD Coin" : "Ethereum",
         symbol: isNativeSell ? "USDC" : "ETH",
         logoURI: "https://uni.onekey-asset.com/static/chain/eth.png"
+    };
+
+    const quote = {
+      info: {
+        provider: 'SwapLifi',
+        providerLogo: 'https://uni.onekey-asset.com/static/logo/lifi.png',
+        providerName: 'Li.fi (Bitrabo)',
       },
+      fromTokenInfo,
+      toTokenInfo,
       protocol: 'Swap',
       kind: 'sell',
       
@@ -99,14 +104,6 @@ async function fetchMockQuotes(params) {
       
       instantRate: rate.toString(),
       estimatedTime: 30,
-      
-      // Pass VITAL info to build-tx
-      quoteResultCtx: { 
-          mock: true, 
-          fromAmount: fromAmountRaw,
-          isNative: isNativeSell,
-          fromTokenAddress: fromToken
-      },
       
       fee: {
         percentageFee: 0.25, 
@@ -118,6 +115,18 @@ async function fetchMockQuotes(params) {
           part: 100,
           subRoutes: [[{ name: "Li.Fi", part: 100 }]]
       }],
+      
+      // CRITICAL: Pass EVERYTHING to build-tx so we can reconstruct the Rich Response
+      quoteResultCtx: { 
+          mock: true, 
+          fromAmount: fromAmountRaw.toString(),
+          toAmount: toAmountRaw.toString(),
+          isNative: isNativeSell,
+          fromTokenAddress: fromToken,
+          fromTokenInfo,
+          toTokenInfo,
+          instantRate: rate.toString()
+      },
       
       allowanceResult: null,
       gasLimit: 500000,
@@ -171,47 +180,58 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   }
 });
 
-// --- BUILD TX (GOLDEN KEY MATCHED) ---
+// --- RICH RESPONSE BUILD-TX ---
 app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
   try {
-      console.log("[⚙️ BUILD-TX] Generating Transaction...");
+      console.log("[⚙️ BUILD-TX] Generating Rich Response...");
       
-      let fromAmount = "0";
-      let isNative = true;
-      let fromTokenAddress = "";
-      let userAddress = req.body.userAddress;
-
-      if (req.body && req.body.quoteResultCtx) {
-          fromAmount = req.body.quoteResultCtx.fromAmount || "0";
-          isNative = req.body.quoteResultCtx.isNative;
-          fromTokenAddress = req.body.quoteResultCtx.fromTokenAddress;
-      }
+      let ctx = req.body.quoteResultCtx || {};
+      let userAddress = req.body.userAddress || "0x0000000000000000000000000000000000000000";
+      
+      // Defaults if context is missing
+      const fromAmount = ctx.fromAmount || "0";
+      const toAmount = ctx.toAmount || "0";
+      const isNative = ctx.isNative;
+      const fromTokenAddress = ctx.fromTokenAddress || "";
 
       let txTo, txValue, txData;
 
       if (isNative) {
-          // ETH: Send directly to Self
+          // ETH Self Transfer
           txTo = userAddress;
-          txValue = ethers.parseUnits(fromAmount.toString(), 18).toString();
+          txValue = ethers.parseUnits(fromAmount, 18).toString();
           txData = "0x";
       } else {
-          // TOKEN: Encode "transfer(to, amount)" to Self
-          // This creates valid EVM data so simulation succeeds
-          txTo = fromTokenAddress; // Send TO the token contract
+          // Token Self Transfer
+          txTo = fromTokenAddress;
           txValue = "0";
-          
           const abi = ["function transfer(address to, uint256 amount) returns (bool)"];
           const iface = new ethers.Interface(abi);
-          // Assuming 6 decimals for USDT mockup
-          const amountAtomic = ethers.parseUnits(fromAmount.toString(), 6); 
+          const amountAtomic = ethers.parseUnits(fromAmount, 6); 
           txData = iface.encodeFunctionData("transfer", [userAddress, amountAtomic]);
       }
 
-      // Structure matches the Golden Key Spy Log EXACTLY
+      // THE RICH RESPONSE (Matches Golden Key structure)
       const response = {
         result: { 
-            info: { provider: 'SwapLifi', providerName: 'Li.fi (Bitrabo)' },
-            routesData: [] // Required by Golden Key
+            info: { provider: 'SwapLifi', providerName: 'Li.fi (Bitrabo)', providerLogo: 'https://uni.onekey-asset.com/static/logo/lifi.png' },
+            fromTokenInfo: ctx.fromTokenInfo,
+            toTokenInfo: ctx.toTokenInfo,
+            protocol: "Swap",
+            kind: "sell",
+            fromAmount: fromAmount,
+            toAmount: toAmount,
+            instantRate: ctx.instantRate,
+            estimatedTime: 30,
+            fee: { percentageFee: 0.25 },
+            routesData: [{
+                name: "Li.Fi",
+                part: 100,
+                subRoutes: [[{ name: "Li.Fi", part: 100, logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]]
+            }],
+            gasLimit: 500000,
+            slippage: 0.5,
+            oneKeyFeeExtraInfo: {}
         },
         ctx: { lifiToNetworkId: "evm--1" },
         orderId: uuidv4(),
@@ -220,11 +240,11 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
           value: txValue,
           data: txData, 
           from: userAddress,
-          gas: "100000"
+          gas: "500000"
         }
       };
 
-      console.log("[✅ BUILD-TX] Sending Valid Simulation Data");
+      console.log("[✅ BUILD-TX] Response Sent.");
       res.json(ok(response));
 
   } catch (e) {
@@ -244,5 +264,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo VALID MOCK Server v24 Running on ${PORT}`);
+  console.log(`Bitrabo RICH MOCK Server v25 Running on ${PORT}`);
 });
