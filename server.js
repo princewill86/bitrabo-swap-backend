@@ -4,7 +4,7 @@ const cors = require('cors');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const BigNumber = require('bignumber.js');
 const { ethers } = require('ethers');
-const { createConfig, getRoutes, getToken } = require('@lifi/sdk');
+const { createConfig, getRoutes, getToken, getStepTransaction } = require('@lifi/sdk');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
@@ -20,7 +20,6 @@ const jsonParser = express.json();
 const ok = (data) => ({ code: 0, message: "Success", data });
 
 app.use((req, res, next) => {
-  // Only hijack Quote and Build-Tx. Let Provider List go through to OneKey!
   const isHijack = req.url.includes('quote') || req.url.includes('build-tx');
   console.log(isHijack ? `[⚡ HIJACK] ${req.method} ${req.url}` : `[🔄 PROXY] ${req.method} ${req.url}`);
   next();
@@ -88,12 +87,11 @@ async function fetchLiFiQuotes(params) {
       const toAmountDecimal = await formatAmountOutput(toChain, route.toToken.address, route.toAmount);
       const minToAmountDecimal = await formatAmountOutput(toChain, route.toToken.address, route.toAmountMin);
 
-      // Log the conversion to debug the "Value Mismatch"
       if(i===0) console.log(`[✅ QUOTE] ${fromAmountDecimal} -> ${toAmountDecimal}`);
 
       return {
         info: {
-          provider: 'SwapLifi', // Use the ID OneKey expects
+          provider: 'SwapLifi', 
           providerLogo: 'https://uni.onekey-asset.com/static/logo/lifi.png',
           providerName: 'Li.fi (Bitrabo)',
         },
@@ -118,9 +116,10 @@ async function fetchLiFiQuotes(params) {
         minToAmount: minToAmountDecimal,
         instantRate: new BigNumber(toAmountDecimal).div(fromAmountDecimal).toString(),
         estimatedTime: 30,
+        
+        // Pass the RAW route so build-tx can use it
         quoteResultCtx: { lifiQuoteResultCtx: route }, 
         
-        // --- FEE & LOGOS (Critical for UI) ---
         fee: {
           percentageFee: Number(process.env.BITRABO_FEE || 0.0025) * 100, // Display 0.25%
           estimatedFeeFiatValue: 0.1 
@@ -131,7 +130,7 @@ async function fetchLiFiQuotes(params) {
             subRoutes: [[{ name: "Li.Fi", part: 100, logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]]
         }],
         
-        allowanceResult: null, // Let OneKey handle approval logic
+        allowanceResult: null, // Force frontend logic
         gasLimit: 500000,
         oneKeyFeeExtraInfo: {},
         supportUrl: "https://help.onekey.so/hc/requests/new",
@@ -156,11 +155,11 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   try {
     const quotes = await fetchLiFiQuotes({ ...req.query, eventId });
     
-    // ONEKEY HEADER
+    // Header
     res.write(`data: ${JSON.stringify({ totalQuoteCount: quotes.length, eventId })}\n\n`);
     res.write(`data: ${JSON.stringify({ autoSuggestedSlippage: 0.5, eventId })}\n\n`);
 
-    // QUOTES
+    // Quotes
     for (const quote of quotes) {
         res.write(`data: ${JSON.stringify({ data: [quote] })}\n\n`);
     }
@@ -174,33 +173,46 @@ app.get('/swap/v1/quote/events', async (req, res) => {
 });
 
 // ==================================================================
-// 3. HIJACKED TRANSACTION BUILDER
+// 3. HIJACKED TRANSACTION BUILDER (FIXED)
 // ==================================================================
 
 app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
   try {
+    console.log("[⚙️ BUILD-TX] Received Request");
     const { quoteResultCtx, userAddress } = req.body;
     const route = quoteResultCtx?.lifiQuoteResultCtx;
 
-    if (!route || !route.steps) return res.json(ok(null));
+    if (!route || !route.steps) {
+        console.error("Missing route context");
+        return res.json(ok(null));
+    }
 
+    // CRITICAL FIX: Fetch FRESH transaction data from Li.Fi
+    // This ensures we get the latest 'data' payload for the current block
     const step = route.steps[0];
-    const tx = step.transactionRequest;
+    console.log(`[⚙️ BUILD-TX] Fetching Transaction for Step: ${step.id}`);
+    
+    const transaction = await getStepTransaction(step); 
 
-    if (!tx) throw new Error("No transaction request found");
+    if (!transaction) {
+        console.error("Li.Fi failed to return transaction data");
+        throw new Error("No transaction request found");
+    }
+
+    console.log("[✅ BUILD-TX] Success!");
 
     res.json(ok({
       result: { info: { provider: 'SwapLifi', providerName: 'Li.fi (Bitrabo)' } },
       tx: {
-        to: tx.to,
-        value: tx.value ? new BigNumber(tx.value).toFixed() : '0',
-        data: tx.data,
+        to: transaction.to,
+        value: transaction.value ? new BigNumber(transaction.value).toFixed() : '0',
+        data: transaction.data,
         from: userAddress,
-        gas: tx.gasLimit ? new BigNumber(tx.gasLimit).toFixed() : undefined
+        gas: transaction.gasLimit ? new BigNumber(transaction.gasLimit).toFixed() : undefined
       }
     }));
   } catch (e) {
-    console.error(e);
+    console.error("[❌ BUILD-TX ERROR]", e);
     res.json(ok(null));
   }
 });
@@ -220,5 +232,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo Stealth Server v20 Running on ${PORT}`);
+  console.log(`Bitrabo Stealth Server v21 Running on ${PORT}`);
 });
