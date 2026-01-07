@@ -10,7 +10,6 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CONFIG
 const INTEGRATOR = process.env.BITRABO_INTEGRATOR || 'bitrabo';
 const FEE_PERCENT = Number(process.env.BITRABO_FEE || 0.0025); 
 
@@ -77,9 +76,7 @@ async function fetchLiFiQuotes(params) {
     const toChain = parseInt(params.toNetworkId.replace('evm--', ''));
     const fromToken = params.fromTokenAddress || '0x0000000000000000000000000000000000000000';
     const toToken = params.toTokenAddress || '0x0000000000000000000000000000000000000000';
-    
-    // STRICT NATIVE CHECK
-    const isNativeSell = (!fromToken || fromToken === '' || fromToken === '0x0000000000000000000000000000000000000000' || fromToken.toLowerCase() === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee');
+    const isNativeSell = fromToken === '0x0000000000000000000000000000000000000000';
 
     const amount = await normalizeAmountInput(fromChain, fromToken, params.fromTokenAmount);
     if(!amount || amount === '0') return [];
@@ -109,7 +106,6 @@ async function fetchLiFiQuotes(params) {
 
       if (i===0) console.log(`[✅ QUOTE] ${fromAmountDecimal} -> ${toAmountDecimal}`);
 
-      // Token Info Objects
       const fromTokenInfo = {
         contractAddress: isNativeSell ? '' : route.fromToken.address,
         networkId: params.fromNetworkId,
@@ -144,9 +140,8 @@ async function fetchLiFiQuotes(params) {
         toAmount: toAmountDecimal,
         minToAmount: minToAmountDecimal,
         instantRate: new BigNumber(toAmountDecimal).div(fromAmountDecimal).toString(),
-        estimatedTime: 30, // Force 30s to match Mock
+        estimatedTime: 30, // Force 30s to be safe
         
-        // Pass FULL context to build-tx
         quoteResultCtx: { 
             lifiQuoteResultCtx: route,
             fromTokenInfo,
@@ -161,7 +156,7 @@ async function fetchLiFiQuotes(params) {
           estimatedFeeFiatValue: 0.1 
         },
         
-        // --- REVERTED TO WORKING "MOCK" FORMAT ---
+        // --- THIS IS THE FIX (Reverted to v25 Structure) ---
         routesData: [{
             name: "Li.Fi",
             part: 100,
@@ -173,7 +168,8 @@ async function fetchLiFiQuotes(params) {
         oneKeyFeeExtraInfo: {},
         supportUrl: "https://help.onekey.so/hc/requests/new",
         quoteId: uuidv4(),
-        eventId: params.eventId
+        eventId: params.eventId,
+        isBest: i === 0 // Mark first quote as best
       };
     }));
   } catch (e) {
@@ -220,7 +216,6 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   }
 });
 
-// REAL TRANSACTION BUILDER
 app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
   try {
     const { quoteResultCtx, userAddress } = req.body;
@@ -230,8 +225,6 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
 
     console.log("[⚙️ BUILD-TX] Fetching Li.Fi Transaction...");
     const step = route.steps[0];
-    
-    // Fetch fresh transaction data
     const transaction = await getStepTransaction(step); 
 
     if (!transaction) throw new Error("Li.Fi failed to return transaction");
@@ -248,7 +241,6 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
             instantRate: quoteResultCtx.instantRate,
             estimatedTime: 30,
             fee: { percentageFee: FEE_PERCENT * 100 }, 
-            // Revert to Working Mock Structure
             routesData: [{
                 name: "Li.Fi",
                 part: 100,
@@ -278,7 +270,6 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
   }
 });
 
-// Proxy Fallback
 app.use('/swap/v1', createProxyMiddleware({
   target: 'https://swap.onekeycn.com',
   changeOrigin: true,
@@ -289,5 +280,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo PRODUCTION Server v29 Running on ${PORT}`);
+  console.log(`Bitrabo PRODUCTION Server v30 Running on ${PORT}`);
 });
