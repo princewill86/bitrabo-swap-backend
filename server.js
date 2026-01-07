@@ -4,7 +4,7 @@ const cors = require('cors');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const BigNumber = require('bignumber.js');
 const { ethers } = require('ethers');
-const { createConfig, getToken } = require('@lifi/sdk');
+const { createConfig, getToken } = require('@lifi/sdk'); 
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
@@ -16,14 +16,15 @@ createConfig({
 });
 
 app.use(cors({ origin: '*' }));
-const jsonParser = express.json();
-const ok = (data) => ({ code: 0, message: "Success", data });
 
+// --- LOGGING ---
 app.use((req, res, next) => {
   const isHijack = req.url.includes('quote') || req.url.includes('providers') || req.url.includes('check-support') || req.url.includes('build-tx');
   console.log(isHijack ? `[⚡ HIJACK] ${req.method} ${req.url}` : `[🔄 PROXY] ${req.method} ${req.url}`);
   next();
 });
+
+const ok = (data) => ({ code: 0, message: "Success", data });
 
 // ==================================================================
 // 1. HIJACKED ROUTES
@@ -33,7 +34,6 @@ app.get(['/swap/v1/check-support', '/check-support'], (req, res) => {
   res.json(ok([{ status: 'available', networkId: req.query.networkId }]));
 });
 
-// Hijack Provider List to ensure LiFi is selected
 app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
   res.json(ok([{
     provider: 'SwapLifi',
@@ -45,7 +45,7 @@ app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
   }]));
 });
 
-// Mock Quote Logic
+// Mock Logic
 async function fetchMockQuotes(params) {
   try {
     const fromChain = parseInt(params.fromNetworkId.replace('evm--', ''));
@@ -53,20 +53,17 @@ async function fetchMockQuotes(params) {
     const toToken = params.toTokenAddress;
     
     // STRICT NATIVE CHECK
-    // If address is missing, empty string, or the zero address -> It is ETH
     const isNativeSell = (!fromToken || fromToken === '' || fromToken === '0x0000000000000000000000000000000000000000' || fromToken.toLowerCase() === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee');
 
     const fromAmountRaw = params.fromTokenAmount || "1";
     let rate, toAmountRaw;
 
     if (isNativeSell) {
-        // ETH -> USDC (Price ~3250)
         rate = 3250.5;
-        toAmountRaw = (parseFloat(fromAmountRaw) * rate).toFixed(6); // USDC = 6 decimals
+        toAmountRaw = (parseFloat(fromAmountRaw) * rate).toFixed(6); 
     } else {
-        // Token -> ETH (Price ~1/3250)
         rate = 1 / 3250.5; 
-        toAmountRaw = (parseFloat(fromAmountRaw) * rate).toFixed(18); // ETH = 18 decimals
+        toAmountRaw = (parseFloat(fromAmountRaw) * rate).toFixed(18); 
     }
 
     console.log(`[⚠️ MOCK CALC] ${fromAmountRaw} ${isNativeSell ? 'ETH' : 'USDT'} -> ${toAmountRaw}`);
@@ -105,7 +102,7 @@ async function fetchMockQuotes(params) {
       instantRate: rate.toString(),
       estimatedTime: 30,
       
-      // Pass data to build-tx
+      // Pass data safely to build-tx
       quoteResultCtx: { 
           mock: true, 
           fromAmount: fromAmountRaw,
@@ -114,7 +111,7 @@ async function fetchMockQuotes(params) {
       },
       
       fee: {
-        percentageFee: 0.25, // FIXED: Display 0.25%
+        percentageFee: 0.25, 
         estimatedFeeFiatValue: 0.1
       },
       
@@ -176,38 +173,51 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   }
 });
 
-// MOCK BUILD TX - FIXED
-app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
+// CRASH PROOF BUILD-TX
+app.post('/swap/v1/build-tx', express.json(), async (req, res) => {
   try {
-      const { quoteResultCtx, userAddress } = req.body;
-      const { fromAmount, isNative } = quoteResultCtx;
+      console.log("[⚙️ BUILD-TX] Generating Transaction...");
+      
+      // Default to "0" and "ETH" if body parsing fails
+      let fromAmount = "0";
+      let isNative = true;
+      let userAddress = "0x0000000000000000000000000000000000000000";
+
+      if (req.body && req.body.quoteResultCtx) {
+          fromAmount = req.body.quoteResultCtx.fromAmount || "0";
+          isNative = req.body.quoteResultCtx.isNative;
+          userAddress = req.body.userAddress || userAddress;
+      }
 
       // Calculate Value:
-      // If selling ETH, value = amount (in Wei)
-      // If selling Token, value = 0
       const valueWei = isNative 
-        ? ethers.parseUnits(fromAmount || "0", 18).toString() 
+        ? ethers.parseUnits(fromAmount.toString(), 18).toString() 
         : "0";
 
-      // If selling Token, we need a dummy 'transfer' data string
-      // If selling ETH, data is empty "0x"
-      const data = isNative 
-        ? "0x" 
-        : "0xa9059cbb000000000000000000000000" + userAddress.replace("0x","") + "0000000000000000000000000000000000000000000000000000000000000001"; 
+      // Self-transfer data
+      const data = "0x"; 
 
-      res.json(ok({
+      const response = {
         result: { info: { provider: 'SwapLifi', providerName: 'Li.Fi (Bitrabo)' } },
         tx: {
-          to: userAddress, // Self transfer for safety
+          to: userAddress, 
           value: valueWei,
           data: data, 
           from: userAddress,
-          gas: "100000" // Sufficient gas limit
+          gas: "21000"
         }
-      }));
+      };
+
+      console.log("[✅ BUILD-TX] Sending Response");
+      res.json(ok(response));
+
   } catch (e) {
-      console.error(e);
-      res.json(ok(null));
+      console.error("[❌ BUILD-TX ERROR]", e);
+      // Send a dummy fallback instead of crashing
+      res.json(ok({
+          result: { info: { provider: 'SwapLifi', providerName: 'Li.Fi (Bitrabo)' } },
+          tx: { to: req.body?.userAddress, value: "0", data: "0x" }
+      }));
   }
 });
 
@@ -222,5 +232,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo PERFECT MOCK Server v22 Running on ${PORT}`);
+  console.log(`Bitrabo PERFECT MOCK Server v23 Running on ${PORT}`);
 });
