@@ -12,7 +12,6 @@ const PORT = process.env.PORT || 3000;
 
 // CONFIG
 const INTEGRATOR = process.env.BITRABO_INTEGRATOR || 'bitrabo';
-const FEE_RECEIVER = process.env.BITRABO_FEE_RECEIVER; 
 const FEE_PERCENT = Number(process.env.BITRABO_FEE || 0.0025); 
 
 createConfig({
@@ -96,20 +95,15 @@ async function fetchLiFiQuotes(params) {
       options: {
         integrator: INTEGRATOR,
         fee: FEE_PERCENT,
-        referrer: FEE_RECEIVER 
       }
     });
 
     if (!routesResponse.routes || routesResponse.routes.length === 0) return [];
 
     return await Promise.all(routesResponse.routes.map(async (route, i) => {
-      // Get decimals to ensure precision safety
-      const toDecimals = route.toToken.decimals;
-      
-      const toAmountDecimal = ethers.formatUnits(route.toAmount, toDecimals).toString();
-      
-      // Calculate min amount safely (Clamp to token decimals)
-      const minToAmountDecimal = (parseFloat(toAmountDecimal) * 0.995).toFixed(toDecimals);
+      const fromAmountDecimal = await formatAmountOutput(fromChain, route.fromToken.address, route.fromAmount);
+      const toAmountDecimal = await formatAmountOutput(toChain, route.toToken.address, route.toAmount);
+      const minToAmountDecimal = (parseFloat(toAmountDecimal) * 0.995).toString();
 
       if (i===0) console.log(`[✅ QUOTE] ${params.fromTokenAmount} -> ${toAmountDecimal}`);
 
@@ -127,11 +121,14 @@ async function fetchLiFiQuotes(params) {
         contractAddress: route.toToken.address === '0x0000000000000000000000000000000000000000' ? '' : route.toToken.address,
         networkId: params.toNetworkId,
         isNative: route.toToken.address === '0x0000000000000000000000000000000000000000',
-        decimals: toDecimals,
+        decimals: route.toToken.decimals,
         name: route.toToken.name,
         symbol: route.toToken.symbol,
         logoURI: route.toToken.logoURI
       };
+
+      // Calculate Fee for Display
+      const feeValue = (parseFloat(fromAmountDecimal) * FEE_PERCENT).toFixed(6);
 
       return {
         info: {
@@ -143,12 +140,9 @@ async function fetchLiFiQuotes(params) {
         toTokenInfo,
         protocol: 'Swap',
         kind: 'sell',
-        
-        // --- FIX: Echo EXACT Input String ---
-        fromAmount: params.fromTokenAmount, 
+        fromAmount: params.fromTokenAmount, // Echo input exactly
         toAmount: toAmountDecimal,
         minToAmount: minToAmountDecimal,
-        
         instantRate: new BigNumber(toAmountDecimal).div(params.fromTokenAmount).toString(),
         estimatedTime: 30,
         
@@ -162,18 +156,27 @@ async function fetchLiFiQuotes(params) {
         }, 
         
         fee: {
-          percentageFee: FEE_PERCENT * 100, // Display 0.25%
-          estimatedFeeFiatValue: 0.1 
+          percentageFee: FEE_PERCENT * 100 // Display 0.25%
         },
         
-        // Match the working Mock structure
+        // --- GOLDEN KEY STRUCTURE FIX ---
+        // NO top-level 'name' or 'part'. Only 'subRoutes'.
+        // Use 'percent' as string "100".
         routesData: [{
-            name: "Li.Fi",
-            part: 100,
-            subRoutes: [[{ name: "Li.Fi", part: 100, logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]]
+            subRoutes: [[{ 
+                name: "Li.Fi", 
+                percent: "100", 
+                logo: "https://uni.onekey-asset.com/static/logo/lifi.png" 
+            }]]
         }],
         
-        oneKeyFeeExtraInfo: {},
+        // --- SAFE DEFAULTS FOR FEE INFO ---
+        oneKeyFeeExtraInfo: {
+            oneKeyFeeAmount: feeValue,
+            oneKeyFeeSymbol: fromTokenInfo.symbol || "ETH",
+            oneKeyFeeUsd: "0"
+        },
+        
         allowanceResult: null, 
         gasLimit: 500000,
         supportUrl: "https://help.onekey.so/hc/requests/new",
@@ -199,10 +202,8 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   try {
     const quotes = await fetchLiFiQuotes({ ...req.query, eventId });
     
-    // Header
     res.write(`data: ${JSON.stringify({ totalQuoteCount: quotes.length, eventId })}\n\n`);
     
-    // Slippage
     const slippageInfo = {
         autoSuggestedSlippage: 0.5,
         fromNetworkId: req.query.fromNetworkId,
@@ -213,7 +214,6 @@ app.get('/swap/v1/quote/events', async (req, res) => {
     };
     res.write(`data: ${JSON.stringify(slippageInfo)}\n\n`);
 
-    // Quotes
     for (const quote of quotes) {
         res.write(`data: ${JSON.stringify({ data: [quote] })}\n\n`);
     }
@@ -251,10 +251,10 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
             instantRate: quoteResultCtx.instantRate,
             estimatedTime: 30,
             fee: { percentageFee: FEE_PERCENT * 100 }, 
+            
+            // --- MATCH GOLDEN KEY HERE TOO ---
             routesData: [{
-                name: "Li.Fi",
-                part: 100,
-                subRoutes: [[{ name: "Li.Fi", part: 100, logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]]
+                subRoutes: [[{ name: "Li.Fi", percent: "100", logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]]
             }],
             gasLimit: transaction.gasLimit ? Number(transaction.gasLimit) : 500000,
             slippage: 0.5,
@@ -290,5 +290,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo PRODUCTION Server v33 Running on ${PORT}`);
+  console.log(`Bitrabo PRODUCTION Server v34 Running on ${PORT}`);
 });
