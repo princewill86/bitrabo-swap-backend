@@ -29,12 +29,10 @@ app.use((req, res, next) => {
 // 1. HIJACKED ROUTES
 // ==================================================================
 
-// FIX: Explicitly say "Available" for every network
 app.get(['/swap/v1/check-support', '/check-support'], (req, res) => {
   res.json(ok([{ status: 'available', networkId: req.query.networkId }]));
 });
 
-// FIX: Ensure provider list matches Quote info exactly
 app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
   res.json(ok([{
     provider: 'lifi',
@@ -45,19 +43,29 @@ app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
   }]));
 });
 
+// --- CRITICAL FIX: ALWAYS FETCH DECIMALS ---
 async function normalizeAmount(chainId, tokenAddress, rawAmount) {
-  if (!rawAmount || !rawAmount.includes('.')) return rawAmount;
+  if (!rawAmount || rawAmount === '0') return '0';
+
   try {
+    // 1. Handle Native Token (ETH/BNB/MATIC) -> Always 18 decimals
     if (!tokenAddress || tokenAddress === '' || tokenAddress === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee') {
       return ethers.parseUnits(rawAmount, 18).toString();
     }
+    
+    // 2. Handle ERC20 -> Must fetch decimals (USDT=6, WBTC=8, etc)
     const token = await getToken(chainId, tokenAddress);
     if (token && token.decimals) {
+      // Fix potential "too many decimals" error (e.g. user types 1.1234567 for USDT)
       const safeAmount = Number(rawAmount).toFixed(token.decimals);
       return ethers.parseUnits(safeAmount, token.decimals).toString();
     }
+    
+    // 3. Fallback -> Assume 18 if fetch fails
     return ethers.parseUnits(rawAmount, 18).toString();
   } catch (e) {
+    console.error("Amount Normalization Failed:", e);
+    // If conversion fails, pass raw as last resort (risky but better than crash)
     return rawAmount;
   }
 }
@@ -69,11 +77,12 @@ async function fetchLiFiQuotes(params) {
     const fromToken = params.fromTokenAddress || '0x0000000000000000000000000000000000000000';
     const toToken = params.toTokenAddress || '0x0000000000000000000000000000000000000000';
     
+    // Convert "5" USDT -> "5000000"
     const amount = await normalizeAmount(fromChain, fromToken, params.fromTokenAmount);
     
     if(!amount || amount === '0') return [];
 
-    console.log(`[🔍 LIFI DEBUG] Requesting: ${amount} of ${fromToken} on Chain ${fromChain}`);
+    console.log(`[🔍 LIFI REQUEST] ${params.fromTokenAmount} (${amount} atomic) of ${fromToken} on Chain ${fromChain}`);
 
     const routesResponse = await getRoutes({
       fromChainId: fromChain,
@@ -89,35 +98,9 @@ async function fetchLiFiQuotes(params) {
       }
     });
 
-    // DEBUG: Log exactly what LiFi returned
-    const routeCount = routesResponse.routes ? routesResponse.routes.length : 0;
-    console.log(`[🔍 LIFI DEBUG] Found ${routeCount} routes.`);
-
-    // --- FALLBACK TEST ---
-    // If LiFi returns 0 routes, we inject a FAKE one to prove the UI works.
-    if (routeCount === 0) {
-      console.log("[⚠️ WARNING] No LiFi routes found. Sending DUMMY quote to test UI.");
-      return [{
-        info: {
-          provider: 'lifi',
-          providerName: 'Bitrabo (TEST)',
-          providerLogoURI: 'https://raw.githubusercontent.com/lifinance/types/main/src/assets/logo.png',
-        },
-        fromTokenInfo: { networkId: params.fromNetworkId, contractAddress: fromToken, symbol: 'TEST', decimals: 18 },
-        toTokenInfo: { networkId: params.toNetworkId, contractAddress: toToken, symbol: 'TEST', decimals: 18 },
-        fromAmount: amount,
-        toAmount: amount, // 1:1 rate
-        toAmountMin: amount,
-        instantRate: '1',
-        estimatedTime: 60,
-        kind: 'sell',
-        isBest: true,
-        receivedBest: true,
-        allowanceResult: { isApproved: true },
-        routesData: [],
-        quoteResultCtx: { steps: [] }, // Empty steps might fail build-tx, but will show Quote
-        fee: { percentageFee: 0.0025 }
-      }];
+    if (!routesResponse.routes || routesResponse.routes.length === 0) {
+      console.log(`[⚠️ LIFI] No routes found.`);
+      return [];
     }
 
     return routesResponse.routes.map((route, i) => {
@@ -144,7 +127,7 @@ async function fetchLiFiQuotes(params) {
         toAmount: route.toAmount,
         toAmountMin: route.toAmountMin,
         instantRate: new BigNumber(route.toAmount).div(route.fromAmount).toString(),
-        estimatedTime: 60,
+        estimatedTime: route.toToken.chainId === route.fromToken.chainId ? 30 : 120, // 30s for same chain, 2m for cross
         kind: 'sell',
         isBest: isBest,
         receivedBest: isBest,
@@ -187,13 +170,14 @@ app.get('/swap/v1/quote/events', async (req, res) => {
 app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
   try {
     const { quoteResultCtx, userAddress } = req.body;
-    // Handle our dummy quote case
     if (!quoteResultCtx || !quoteResultCtx.steps || quoteResultCtx.steps.length === 0) {
-      return res.json(ok({ result: { info: { provider: 'lifi' } }, tx: null }));
+      return res.json(ok(null));
     }
 
     const step = quoteResultCtx.steps[0];
     const tx = step.transactionRequest;
+
+    if (!tx) throw new Error("No transaction request found");
 
     res.json(ok({
       result: { info: { provider: 'lifi', providerName: 'Bitrabo' } },
@@ -224,5 +208,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo Hybrid Server v8 Running on ${PORT}`);
+  console.log(`Bitrabo Hybrid Server v9 Running on ${PORT}`);
 });
