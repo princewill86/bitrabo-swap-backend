@@ -15,6 +15,7 @@ const INTEGRATOR = process.env.BITRABO_INTEGRATOR || 'bitrabo';
 const FEE_RECEIVER = process.env.BITRABO_FEE_RECEIVER; 
 const FEE_PERCENT = Number(process.env.BITRABO_FEE || 0.0025); 
 const LIFI_ROUTER_ADDRESS = "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE"; 
+const MAX_ALLOWANCE = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
 
 createConfig({
   integrator: INTEGRATOR,
@@ -26,7 +27,7 @@ const jsonParser = express.json();
 const ok = (data) => ({ code: 0, message: "Success", data });
 
 app.use((req, res, next) => {
-  const isHijack = req.url.includes('quote') || req.url.includes('providers') || req.url.includes('check-support') || req.url.includes('build-tx');
+  const isHijack = req.url.includes('quote') || req.url.includes('providers') || req.url.includes('check-support') || req.url.includes('build-tx') || req.url.includes('allowance');
   console.log(isHijack ? `[⚡ HIJACK] ${req.method} ${req.url}` : `[🔄 PROXY] ${req.method} ${req.url}`);
   next();
 });
@@ -85,6 +86,13 @@ app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
   }]));
 });
 
+// --- NEW: ALLOWANCE HIJACK (The Fix) ---
+app.get(['/swap/v1/allowance', '/allowance'], (req, res) => {
+    // Always return Infinite Allowance so the UI thinks it's approved
+    console.log(`[⚡ ALLOWANCE] Mocking Infinite Approval for ${req.query.tokenAddress}`);
+    res.json(ok(MAX_ALLOWANCE)); 
+});
+
 // REAL QUOTE LOGIC
 async function fetchLiFiQuotes(params, eventId) {
   try {
@@ -122,7 +130,6 @@ async function fetchLiFiQuotes(params, eventId) {
       const toAmountDecimal = await formatAmountOutput(toChain, route.toToken.address, route.toAmount);
       
       const toAmountBN = new BigNumber(toAmountDecimal);
-      const minToAmountDecimal = toAmountBN.multipliedBy(0.995).toFixed();
       const rate = toAmountBN.dividedBy(fromAmountDecimal).toFixed();
 
       if (i===0) console.log(`[✅ QUOTE] ${fromAmountDecimal} -> ${toAmountDecimal}`);
@@ -151,12 +158,12 @@ async function fetchLiFiQuotes(params, eventId) {
         logoURI: route.toToken.logoURI
       };
 
-      // --- ALLOWANCE LOGIC (Same-Chain Fix) ---
+      // Mock Allowance in Quote (for UI)
       let allowanceResult = null;
       if (!isFromNative) {
           allowanceResult = {
               allowanceTarget: LIFI_ROUTER_ADDRESS,
-              amount: fromAmountDecimal, 
+              amount: MAX_ALLOWANCE, 
               shouldResetApprove: false
           };
       }
@@ -174,9 +181,17 @@ async function fetchLiFiQuotes(params, eventId) {
         
         fromAmount: fromAmountDecimal,
         toAmount: toAmountDecimal,
-        minToAmount: minToAmountDecimal,
         instantRate: rate,
         estimatedTime: 30,
+        
+        // Strict OKX Structure (No Top-Level Name/Part)
+        routesData: [{
+            subRoutes: [[{ 
+                name: "Li.Fi", 
+                percent: "100", 
+                logo: "https://uni.onekey-asset.com/static/logo/lifi.png" 
+            }]]
+        }],
         
         quoteResultCtx: { 
             lifiRoute: route, 
@@ -192,21 +207,12 @@ async function fetchLiFiQuotes(params, eventId) {
           estimatedFeeFiatValue: 0.1 
         },
         
-        routesData: [{
-            name: "Li.Fi Aggregator",
-            part: 100,
-            subRoutes: [[{ name: "Li.Fi", part: 100, logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]]
-        }],
-        
         oneKeyFeeExtraInfo: {},
         allowanceResult,
         gasLimit: 500000,
         supportUrl: "https://help.onekey.so/hc/requests/new",
         quoteId: uuidv4(),
-        
-        // --- CRITICAL FIX: USE THE GENERATED EVENT ID ---
-        eventId: eventId, // WAS: params.eventId (undefined)
-        
+        eventId: eventId,
         isBest: i === 0 
       };
     }));
@@ -222,10 +228,9 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
-  const eventId = uuidv4(); // Generated here
+  const eventId = uuidv4();
 
   try {
-    // Pass eventId to the fetcher so it can attach it to the quote object
     const quotes = await fetchLiFiQuotes({ ...req.query }, eventId);
     
     res.write(`data: ${JSON.stringify({ totalQuoteCount: quotes.length, eventId })}\n\n`);
@@ -236,12 +241,11 @@ app.get('/swap/v1/quote/events', async (req, res) => {
         toNetworkId: req.query.toNetworkId,
         fromTokenAddress: req.query.fromTokenAddress || "",
         toTokenAddress: req.query.toTokenAddress,
-        eventId: eventId // Matches Stream
+        eventId: eventId
     };
     res.write(`data: ${JSON.stringify(slippageInfo)}\n\n`);
 
     for (const quote of quotes) {
-        // Quote object inside here now also has matching eventId
         res.write(`data: ${JSON.stringify({ data: [quote] })}\n\n`);
     }
 
@@ -281,9 +285,7 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
             fee: { percentageFee: FEE_PERCENT * 100 }, 
             
             routesData: [{
-                name: "Li.Fi Aggregator",
-                part: 100,
-                subRoutes: [[{ name: "Li.Fi", part: 100, logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]]
+                subRoutes: [[{ name: "Li.Fi", percent: "100", logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]]
             }],
             gasLimit: transaction.gasLimit ? Number(transaction.gasLimit) : 500000,
             slippage: 0.5,
@@ -314,10 +316,10 @@ app.use('/swap/v1', createProxyMiddleware({
   changeOrigin: true,
   logLevel: 'silent',
   filter: (pathname) => {
-    return !pathname.includes('providers/list') && !pathname.includes('quote') && !pathname.includes('build-tx') && !pathname.includes('check-support');
+    return !pathname.includes('providers/list') && !pathname.includes('quote') && !pathname.includes('build-tx') && !pathname.includes('check-support') && !pathname.includes('allowance');
   }
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo PRODUCTION Server v51 Running on ${PORT}`);
+  console.log(`Bitrabo PRODUCTION Server v52 Running on ${PORT}`);
 });
