@@ -86,12 +86,11 @@ app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
 });
 
 // REAL QUOTE LOGIC
-async function fetchLiFiQuotes(params) {
+async function fetchLiFiQuotes(params, eventId) {
   try {
     const fromChain = parseInt(params.fromNetworkId.replace('evm--', ''));
     const toChain = parseInt(params.toNetworkId.replace('evm--', ''));
     
-    // Normalization
     const fromToken = params.fromTokenAddress || '0x0000000000000000000000000000000000000000';
     const isNativeSell = fromToken === '0x0000000000000000000000000000000000000000' || 
                          fromToken.toLowerCase() === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
@@ -152,12 +151,12 @@ async function fetchLiFiQuotes(params) {
         logoURI: route.toToken.logoURI
       };
 
-      // --- EXACT AMOUNT ALLOWANCE FIX ---
+      // --- ALLOWANCE LOGIC (Same-Chain Fix) ---
       let allowanceResult = null;
       if (!isFromNative) {
           allowanceResult = {
               allowanceTarget: LIFI_ROUTER_ADDRESS,
-              amount: fromAmountDecimal, // Exact amount required
+              amount: fromAmountDecimal, 
               shouldResetApprove: false
           };
       }
@@ -193,7 +192,6 @@ async function fetchLiFiQuotes(params) {
           estimatedFeeFiatValue: 0.1 
         },
         
-        // Structure matches Working Mock v25
         routesData: [{
             name: "Li.Fi Aggregator",
             part: 100,
@@ -205,7 +203,10 @@ async function fetchLiFiQuotes(params) {
         gasLimit: 500000,
         supportUrl: "https://help.onekey.so/hc/requests/new",
         quoteId: uuidv4(),
-        eventId: params.eventId,
+        
+        // --- CRITICAL FIX: USE THE GENERATED EVENT ID ---
+        eventId: eventId, // WAS: params.eventId (undefined)
+        
         isBest: i === 0 
       };
     }));
@@ -221,10 +222,11 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
-  const eventId = uuidv4();
+  const eventId = uuidv4(); // Generated here
 
   try {
-    const quotes = await fetchLiFiQuotes({ ...req.query, eventId });
+    // Pass eventId to the fetcher so it can attach it to the quote object
+    const quotes = await fetchLiFiQuotes({ ...req.query }, eventId);
     
     res.write(`data: ${JSON.stringify({ totalQuoteCount: quotes.length, eventId })}\n\n`);
     
@@ -234,11 +236,12 @@ app.get('/swap/v1/quote/events', async (req, res) => {
         toNetworkId: req.query.toNetworkId,
         fromTokenAddress: req.query.fromTokenAddress || "",
         toTokenAddress: req.query.toTokenAddress,
-        eventId: eventId
+        eventId: eventId // Matches Stream
     };
     res.write(`data: ${JSON.stringify(slippageInfo)}\n\n`);
 
     for (const quote of quotes) {
+        // Quote object inside here now also has matching eventId
         res.write(`data: ${JSON.stringify({ data: [quote] })}\n\n`);
     }
 
@@ -316,5 +319,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo PRODUCTION Server v50 Running on ${PORT}`);
+  console.log(`Bitrabo PRODUCTION Server v51 Running on ${PORT}`);
 });
