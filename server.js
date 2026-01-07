@@ -14,7 +14,6 @@ const PORT = process.env.PORT || 3000;
 const INTEGRATOR = process.env.BITRABO_INTEGRATOR || 'bitrabo';
 const FEE_RECEIVER = process.env.BITRABO_FEE_RECEIVER; 
 const FEE_PERCENT = Number(process.env.BITRABO_FEE || 0.0025); 
-const LIFI_ROUTER_ADDRESS = "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE"; 
 const MAX_ALLOWANCE = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
 
 createConfig({
@@ -86,11 +85,11 @@ app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
   }]));
 });
 
-// --- NEW: ALLOWANCE HIJACK (The Fix) ---
+// --- ALLOWANCE HIJACK ---
+// Returns valid JSON object, not just string
 app.get(['/swap/v1/allowance', '/allowance'], (req, res) => {
-    // Always return Infinite Allowance so the UI thinks it's approved
-    console.log(`[⚡ ALLOWANCE] Mocking Infinite Approval for ${req.query.tokenAddress}`);
-    res.json(ok(MAX_ALLOWANCE)); 
+    console.log(`[⚡ ALLOWANCE] Mocking Infinite Approval`);
+    res.json(ok({ allowance: MAX_ALLOWANCE })); 
 });
 
 // REAL QUOTE LOGIC
@@ -158,11 +157,15 @@ async function fetchLiFiQuotes(params, eventId) {
         logoURI: route.toToken.logoURI
       };
 
-      // Mock Allowance in Quote (for UI)
+      // --- DYNAMIC ALLOWANCE LOGIC ---
       let allowanceResult = null;
       if (!isFromNative) {
+          // Get the REAL spender address from Li.Fi route
+          const step = route.steps[0];
+          const approvalAddress = step.estimate.approvalAddress || step.action.toToken.address;
+          
           allowanceResult = {
-              allowanceTarget: LIFI_ROUTER_ADDRESS,
+              allowanceTarget: approvalAddress, // REAL Target
               amount: MAX_ALLOWANCE, 
               shouldResetApprove: false
           };
@@ -184,7 +187,6 @@ async function fetchLiFiQuotes(params, eventId) {
         instantRate: rate,
         estimatedTime: 30,
         
-        // Strict OKX Structure (No Top-Level Name/Part)
         routesData: [{
             subRoutes: [[{ 
                 name: "Li.Fi", 
@@ -321,5 +323,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo PRODUCTION Server v52 Running on ${PORT}`);
+  console.log(`Bitrabo PRODUCTION Server v53 Running on ${PORT}`);
 });
