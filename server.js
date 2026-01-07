@@ -102,11 +102,14 @@ async function fetchLiFiQuotes(params) {
     return await Promise.all(routesResponse.routes.map(async (route, i) => {
       const fromAmountDecimal = await formatAmountOutput(fromChain, route.fromToken.address, route.fromAmount);
       const toAmountDecimal = await formatAmountOutput(toChain, route.toToken.address, route.toAmount);
-      const minToAmountDecimal = await formatAmountOutput(toChain, route.toToken.address, route.toAmountMin);
+      
+      // Manually calculate min amount to be safe (99.5% of output)
+      // This prevents "undefined" minAmount errors
+      const minToAmountDecimal = (parseFloat(toAmountDecimal) * 0.995).toString();
 
       if (i===0) console.log(`[✅ QUOTE] ${fromAmountDecimal} -> ${toAmountDecimal}`);
 
-      // Token Info
+      // Token Info Objects
       const fromTokenInfo = {
         contractAddress: isNativeSell ? '' : route.fromToken.address,
         networkId: params.fromNetworkId,
@@ -141,8 +144,9 @@ async function fetchLiFiQuotes(params) {
         toAmount: toAmountDecimal,
         minToAmount: minToAmountDecimal,
         instantRate: new BigNumber(toAmountDecimal).div(fromAmountDecimal).toString(),
-        estimatedTime: 30,
+        estimatedTime: 30, // Force 30s to match Mock
         
+        // Pass FULL context to build-tx
         quoteResultCtx: { 
             lifiQuoteResultCtx: route,
             fromTokenInfo,
@@ -153,25 +157,25 @@ async function fetchLiFiQuotes(params) {
         }, 
         
         fee: {
-          percentageFee: FEE_PERCENT * 100, // 0.25
+          percentageFee: FEE_PERCENT * 100, // Display 0.25%
           estimatedFeeFiatValue: 0.1 
         },
         
-        // --- REVERTED TO v25 STRUCTURE (Number part, not String percent) ---
+        // --- REVERTED TO WORKING "MOCK" FORMAT ---
         routesData: [{
             name: "Li.Fi",
             part: 100,
             subRoutes: [[{ name: "Li.Fi", part: 100, logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]]
         }],
         
-        // --- REVERTED TO v25 STRUCTURE (Empty Fee Extra) ---
         oneKeyFeeExtraInfo: {},
         
         allowanceResult: null, 
         gasLimit: 500000,
         supportUrl: "https://help.onekey.so/hc/requests/new",
         quoteId: uuidv4(),
-        eventId: params.eventId
+        eventId: params.eventId,
+        isBest: i === 0 
       };
     }));
   } catch (e) {
@@ -284,5 +288,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo PRODUCTION Server v31 Running on ${PORT}`);
+  console.log(`Bitrabo PRODUCTION Server v32 Running on ${PORT}`);
 });
