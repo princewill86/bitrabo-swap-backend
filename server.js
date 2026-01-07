@@ -73,15 +73,20 @@ app.get(['/swap/v1/check-support', '/check-support'], (req, res) => {
   res.json(ok([{ status: 'available', networkId: req.query.networkId }]));
 });
 
+// --- EXCLUSIVE PROVIDER LIST ---
+// This tells the frontend: "Li.Fi is the ONLY provider available."
 app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
-  res.json(ok([{
-    provider: 'SwapLifi',
-    name: 'Li.fi (Bitrabo)',
-    logoURI: 'https://uni.onekey-asset.com/static/logo/lifi.png',
-    status: 'available',
-    priority: 1,
-    protocols: ['swap']
-  }]));
+  res.json(ok([
+    {
+        provider: 'SwapLifi',
+        name: 'Li.fi (Bitrabo)',
+        logoURI: 'https://uni.onekey-asset.com/static/logo/lifi.png',
+        status: 'available',
+        priority: 100, // Highest priority
+        protocols: ['swap']
+    }
+    // No other providers returned.
+  ]));
 });
 
 // REAL QUOTE LOGIC (EAGER LOADING)
@@ -117,8 +122,8 @@ async function fetchLiFiQuotes(params, eventId) {
     if (!routesResponse.routes || routesResponse.routes.length === 0) return [];
 
     return await Promise.all(routesResponse.routes.map(async (route, i) => {
-      // --- EAGER FETCH: Get Transaction Data NOW ---
-      // This is needed for the frontend to validate gas/contract immediately.
+      // Fetch Transaction Data IMMEDIATELY
+      // This gives the frontend the 'data' it needs to stop spinning and validate gas
       const step = route.steps[0];
       const transaction = await getStepTransaction(step); 
 
@@ -172,9 +177,8 @@ async function fetchLiFiQuotes(params, eventId) {
         instantRate: rate,
         estimatedTime: 30,
         
-        // Pass Pre-Calculated Transaction to Context
         quoteResultCtx: { 
-            tx: transaction, // Stored for Build-Tx
+            tx: transaction, 
             fromTokenInfo,
             toTokenInfo,
             fromAmount: fromAmountDecimal,
@@ -195,9 +199,8 @@ async function fetchLiFiQuotes(params, eventId) {
         
         oneKeyFeeExtraInfo: {},
         
-        // --- HONEST ALLOWANCE ---
-        // Sending null forces the frontend to check the chain. 
-        // If it's 0, it shows "Approve". If it's Max, it shows "Swap".
+        // Honest Allowance: null tells frontend to check the chain itself.
+        // Since we have the Tx Data (Eager Loading), it can check gas/allowance accurately.
         allowanceResult: null, 
         
         gasLimit: transaction.gasLimit ? Number(transaction.gasLimit) : 500000,
@@ -310,5 +313,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo PRODUCTION Server v54 Running on ${PORT}`);
+  console.log(`Bitrabo PRODUCTION Server v55 Running on ${PORT}`);
 });
