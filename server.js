@@ -18,6 +18,7 @@ app.use(cors({ origin: '*' }));
 const jsonParser = express.json();
 const ok = (data) => ({ code: 0, data });
 
+// --- LOGGING ---
 app.use((req, res, next) => {
   const isHijack = req.url.includes('quote') || req.url.includes('providers') || req.url.includes('check-support');
   console.log(isHijack ? `[⚡ HIJACK] ${req.method} ${req.url}` : `[🔄 PROXY] ${req.method} ${req.url}`);
@@ -68,6 +69,9 @@ async function fetchLiFiQuotes(params) {
     const fromToken = params.fromTokenAddress || '0x0000000000000000000000000000000000000000';
     const toToken = params.toTokenAddress || '0x0000000000000000000000000000000000000000';
     
+    // Check if Native Token (ETH, MATIC, BNB)
+    const isNative = fromToken === '0x0000000000000000000000000000000000000000';
+
     const amount = await normalizeAmount(fromChain, fromToken, params.fromTokenAmount);
     
     if(!amount || amount === '0') return [];
@@ -124,7 +128,12 @@ async function fetchLiFiQuotes(params) {
         isBest: isBest,
         receivedBest: isBest,
         quoteResultCtx: route, 
-        allowanceResult: { isApproved: true },
+        
+        // --- CRITICAL FIX IS HERE ---
+        // Only send allowanceResult if it's NOT native token.
+        // If we send this for ETH, OneKey tries to "Approve ETH" and fails.
+        allowanceResult: isNative ? null : { isApproved: true }, 
+        
         routesData: route.steps.map(s => ({
             name: s.toolDetails.name,
             part: 100,
@@ -150,10 +159,7 @@ app.get('/swap/v1/quote/events', async (req, res) => {
 
   try {
     const quotes = await fetchLiFiQuotes(req.query);
-    
-    // --- FIX IS HERE: Wrap the array in 'ok()' ---
     const responsePayload = ok(quotes); 
-    
     res.write(`data: ${JSON.stringify(responsePayload)}\n\n`);
     res.write(`data: {"type":"done"}\n\n`);
   } catch (e) {
@@ -204,5 +210,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo Hybrid Server v10 Running on ${PORT}`);
+  console.log(`Bitrabo Hybrid Server v11 Running on ${PORT}`);
 });
