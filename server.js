@@ -31,25 +31,17 @@ app.use((req, res, next) => {
 });
 
 // ==================================================================
-// 1. HIJACKED ROUTES
+// 1. HELPERS
 // ==================================================================
 
-app.get(['/swap/v1/check-support', '/check-support'], (req, res) => {
-  res.json(ok([{ status: 'available', networkId: req.query.networkId }]));
-});
+// CRITICAL FIX: Convert LiFi 0x000... to OneKey 0xeee...
+function normalizeAddress(address) {
+    if (!address || address === '0x0000000000000000000000000000000000000000') {
+        return '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+    }
+    return address.toLowerCase();
+}
 
-app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
-  res.json(ok([{
-    provider: 'SwapLifi',
-    name: 'Li.fi (Bitrabo)',
-    logoURI: 'https://uni.onekey-asset.com/static/logo/lifi.png',
-    status: 'available',
-    priority: 1,
-    protocols: ['swap']
-  }]));
-});
-
-// HELPERS
 async function getDecimals(chainId, tokenAddress) {
     if (!tokenAddress || tokenAddress === '' || tokenAddress === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee') return 18;
     try {
@@ -71,27 +63,33 @@ async function formatAmountOutput(chainId, tokenAddress, amountWei) {
     return ethers.formatUnits(amountWei, decimals).toString();
 }
 
-// --- SANITIZER (The Fix) ---
-function sanitizeDecimal(value, maxDecimals = 8) {
-    if (!value) return "0";
-    // Truncate to max decimals to prevent UI crash
-    if (value.includes('.')) {
-        const parts = value.split('.');
-        if (parts[1].length > maxDecimals) {
-            return `${parts[0]}.${parts[1].substring(0, maxDecimals)}`;
-        }
-    }
-    return value;
-}
+// ==================================================================
+// 2. ROUTES
+// ==================================================================
 
-// REAL QUOTE LOGIC
+app.get(['/swap/v1/check-support', '/check-support'], (req, res) => {
+  res.json(ok([{ status: 'available', networkId: req.query.networkId }]));
+});
+
+app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
+  res.json(ok([{
+    provider: 'SwapLifi',
+    name: 'Li.fi (Bitrabo)',
+    logoURI: 'https://uni.onekey-asset.com/static/logo/lifi.png',
+    status: 'available',
+    priority: 1,
+    protocols: ['swap']
+  }]));
+});
+
 async function fetchLiFiQuotes(params) {
   try {
     const fromChain = parseInt(params.fromNetworkId.replace('evm--', ''));
     const toChain = parseInt(params.toNetworkId.replace('evm--', ''));
     const fromToken = params.fromTokenAddress || '0x0000000000000000000000000000000000000000';
     const toToken = params.toTokenAddress || '0x0000000000000000000000000000000000000000';
-    const isNativeSell = fromToken === '0x0000000000000000000000000000000000000000';
+    
+    const isNativeSell = fromToken === '0x0000000000000000000000000000000000000000' || fromToken.toLowerCase() === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
 
     const amount = await normalizeAmountInput(fromChain, fromToken, params.fromTokenAmount);
     if(!amount || amount === '0') return [];
@@ -116,24 +114,18 @@ async function fetchLiFiQuotes(params) {
     if (!routesResponse.routes || routesResponse.routes.length === 0) return [];
 
     return await Promise.all(routesResponse.routes.map(async (route, i) => {
-      // 1. Get raw amounts
-      const fromAmountDecimal = params.fromTokenAmount; 
-      const toAmountDecimalRaw = await formatAmountOutput(toChain, route.toToken.address, route.toAmount);
+      const fromAmountDecimal = params.fromTokenAmount;
+      const toAmountDecimal = await formatAmountOutput(toChain, route.toToken.address, route.toAmount);
       
-      // 2. SANITIZE OUTPUTS (Prevent precision errors)
-      const toAmountDecimal = sanitizeDecimal(toAmountDecimalRaw, 10);
-      
-      // 3. Simple math for Min Amount
-      const minToAmountDecimal = (parseFloat(toAmountDecimal) * 0.995).toString(); 
-      
-      // 4. Rate calculation
-      const rateRaw = new BigNumber(toAmountDecimal).div(fromAmountDecimal).toString();
-      const rate = sanitizeDecimal(rateRaw, 10);
+      const toAmountBN = new BigNumber(toAmountDecimal);
+      const minToAmountDecimal = toAmountBN.multipliedBy(0.995).toString();
+      const rate = toAmountBN.dividedBy(fromAmountDecimal).toString();
 
       if (i===0) console.log(`[✅ QUOTE] ${fromAmountDecimal} -> ${toAmountDecimal}`);
 
+      // Token Info - NORMALIZED ADDRESSES
       const fromTokenInfo = {
-        contractAddress: isNativeSell ? '' : route.fromToken.address,
+        contractAddress: normalizeAddress(route.fromToken.address),
         networkId: params.fromNetworkId,
         isNative: isNativeSell,
         decimals: route.fromToken.decimals,
@@ -143,7 +135,7 @@ async function fetchLiFiQuotes(params) {
       };
 
       const toTokenInfo = {
-        contractAddress: route.toToken.address === '0x0000000000000000000000000000000000000000' ? '' : route.toToken.address,
+        contractAddress: normalizeAddress(route.toToken.address),
         networkId: params.toNetworkId,
         isNative: route.toToken.address === '0x0000000000000000000000000000000000000000',
         decimals: route.toToken.decimals,
@@ -166,7 +158,7 @@ async function fetchLiFiQuotes(params) {
         toAmount: toAmountDecimal,
         minToAmount: minToAmountDecimal,
         instantRate: rate,
-        estimatedTime: 30, 
+        estimatedTime: 30,
         
         quoteResultCtx: { 
             lifiQuoteResultCtx: route,
@@ -177,20 +169,18 @@ async function fetchLiFiQuotes(params) {
             instantRate: rate
         }, 
         
-        fee: {
-          percentageFee: FEE_PERCENT * 100
-        },
+        fee: { percentageFee: FEE_PERCENT * 100 },
         
-        // v25 STRUCTURE (Verified Working)
+        // Strict Mock Structure
         routesData: [{
-            name: "Li.Fi Aggregator",
+            name: "Li.Fi",
             part: 100,
             subRoutes: [[{ name: "Li.Fi", part: 100, logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]]
         }],
         
+        oneKeyFeeExtraInfo: {},
         allowanceResult: null, 
         gasLimit: 500000,
-        oneKeyFeeExtraInfo: {},
         supportUrl: "https://help.onekey.so/hc/requests/new",
         quoteId: uuidv4(),
         eventId: params.eventId,
@@ -263,13 +253,11 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
             instantRate: quoteResultCtx.instantRate,
             estimatedTime: 30,
             fee: { percentageFee: FEE_PERCENT * 100 }, 
-            
             routesData: [{
-                name: "Li.Fi Aggregator",
+                name: "Li.Fi",
                 part: 100,
                 subRoutes: [[{ name: "Li.Fi", part: 100, logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]]
             }],
-            
             gasLimit: transaction.gasLimit ? Number(transaction.gasLimit) : 500000,
             slippage: 0.5,
             oneKeyFeeExtraInfo: {}
@@ -304,5 +292,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo PRODUCTION Server v40 Running on ${PORT}`);
+  console.log(`Bitrabo PRODUCTION Server v41 Running on ${PORT}`);
 });
