@@ -14,7 +14,6 @@ const PORT = process.env.PORT || 3000;
 const INTEGRATOR = process.env.BITRABO_INTEGRATOR || 'bitrabo';
 const FEE_RECEIVER = process.env.BITRABO_FEE_RECEIVER; 
 const FEE_PERCENT = Number(process.env.BITRABO_FEE || 0.0025); 
-const MAX_ALLOWANCE = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
 
 createConfig({
   integrator: INTEGRATOR,
@@ -26,7 +25,7 @@ const jsonParser = express.json();
 const ok = (data) => ({ code: 0, message: "Success", data });
 
 app.use((req, res, next) => {
-  const isHijack = req.url.includes('quote') || req.url.includes('providers') || req.url.includes('check-support') || req.url.includes('build-tx') || req.url.includes('allowance');
+  const isHijack = req.url.includes('quote') || req.url.includes('providers') || req.url.includes('check-support') || req.url.includes('build-tx');
   console.log(isHijack ? `[⚡ HIJACK] ${req.method} ${req.url}` : `[🔄 PROXY] ${req.method} ${req.url}`);
   next();
 });
@@ -85,14 +84,7 @@ app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
   }]));
 });
 
-// --- ALLOWANCE HIJACK ---
-// Returns valid JSON object, not just string
-app.get(['/swap/v1/allowance', '/allowance'], (req, res) => {
-    console.log(`[⚡ ALLOWANCE] Mocking Infinite Approval`);
-    res.json(ok({ allowance: MAX_ALLOWANCE })); 
-});
-
-// REAL QUOTE LOGIC
+// REAL QUOTE LOGIC (EAGER LOADING)
 async function fetchLiFiQuotes(params, eventId) {
   try {
     const fromChain = parseInt(params.fromNetworkId.replace('evm--', ''));
@@ -125,11 +117,17 @@ async function fetchLiFiQuotes(params, eventId) {
     if (!routesResponse.routes || routesResponse.routes.length === 0) return [];
 
     return await Promise.all(routesResponse.routes.map(async (route, i) => {
+      // --- EAGER FETCH: Get Transaction Data NOW ---
+      // This is needed for the frontend to validate gas/contract immediately.
+      const step = route.steps[0];
+      const transaction = await getStepTransaction(step); 
+
       const fromAmountDecimal = params.fromTokenAmount;
       const toAmountDecimal = await formatAmountOutput(toChain, route.toToken.address, route.toAmount);
       
       const toAmountBN = new BigNumber(toAmountDecimal);
-      const rate = toAmountBN.dividedBy(fromAmountDecimal).toFixed();
+      const minToAmountDecimal = toAmountBN.multipliedBy(0.995).toString();
+      const rate = toAmountBN.dividedBy(fromAmountDecimal).toString();
 
       if (i===0) console.log(`[✅ QUOTE] ${fromAmountDecimal} -> ${toAmountDecimal}`);
 
@@ -157,20 +155,6 @@ async function fetchLiFiQuotes(params, eventId) {
         logoURI: route.toToken.logoURI
       };
 
-      // --- DYNAMIC ALLOWANCE LOGIC ---
-      let allowanceResult = null;
-      if (!isFromNative) {
-          // Get the REAL spender address from Li.Fi route
-          const step = route.steps[0];
-          const approvalAddress = step.estimate.approvalAddress || step.action.toToken.address;
-          
-          allowanceResult = {
-              allowanceTarget: approvalAddress, // REAL Target
-              amount: MAX_ALLOWANCE, 
-              shouldResetApprove: false
-          };
-      }
-
       return {
         info: {
           provider: 'SwapLifi',
@@ -184,19 +168,13 @@ async function fetchLiFiQuotes(params, eventId) {
         
         fromAmount: fromAmountDecimal,
         toAmount: toAmountDecimal,
+        minToAmount: minToAmountDecimal,
         instantRate: rate,
         estimatedTime: 30,
         
-        routesData: [{
-            subRoutes: [[{ 
-                name: "Li.Fi", 
-                percent: "100", 
-                logo: "https://uni.onekey-asset.com/static/logo/lifi.png" 
-            }]]
-        }],
-        
+        // Pass Pre-Calculated Transaction to Context
         quoteResultCtx: { 
-            lifiRoute: route, 
+            tx: transaction, // Stored for Build-Tx
             fromTokenInfo,
             toTokenInfo,
             fromAmount: fromAmountDecimal,
@@ -209,9 +187,20 @@ async function fetchLiFiQuotes(params, eventId) {
           estimatedFeeFiatValue: 0.1 
         },
         
+        routesData: [{
+            name: "Li.Fi Aggregator",
+            part: 100,
+            subRoutes: [[{ name: "Li.Fi", part: 100, logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]]
+        }],
+        
         oneKeyFeeExtraInfo: {},
-        allowanceResult,
-        gasLimit: 500000,
+        
+        // --- HONEST ALLOWANCE ---
+        // Sending null forces the frontend to check the chain. 
+        // If it's 0, it shows "Approve". If it's Max, it shows "Swap".
+        allowanceResult: null, 
+        
+        gasLimit: transaction.gasLimit ? Number(transaction.gasLimit) : 500000,
         supportUrl: "https://help.onekey.so/hc/requests/new",
         quoteId: uuidv4(),
         eventId: eventId,
@@ -259,19 +248,15 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   }
 });
 
-// BUILD-TX
+// BUILD-TX (Uses Cached Data)
 app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
   try {
     const { quoteResultCtx, userAddress } = req.body;
-    const route = quoteResultCtx?.lifiRoute;
+    const tx = quoteResultCtx?.tx;
 
-    if (!route || !route.steps) return res.json(ok(null));
+    if (!tx) return res.json(ok(null));
 
-    console.log("[⚙️ BUILD-TX] Fetching Li.Fi Transaction...");
-    const step = route.steps[0];
-    const transaction = await getStepTransaction(step); 
-
-    if (!transaction) throw new Error("Li.Fi failed to return transaction");
+    console.log("[⚙️ BUILD-TX] Using Pre-Calculated Transaction...");
 
     const response = {
         result: { 
@@ -287,20 +272,22 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
             fee: { percentageFee: FEE_PERCENT * 100 }, 
             
             routesData: [{
-                subRoutes: [[{ name: "Li.Fi", percent: "100", logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]]
+                name: "Li.Fi Aggregator",
+                part: 100,
+                subRoutes: [[{ name: "Li.Fi", part: 100, logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]]
             }],
-            gasLimit: transaction.gasLimit ? Number(transaction.gasLimit) : 500000,
+            gasLimit: tx.gasLimit ? Number(tx.gasLimit) : 500000,
             slippage: 0.5,
             oneKeyFeeExtraInfo: {}
         },
         ctx: { lifiToNetworkId: "evm--1" },
         orderId: uuidv4(),
         tx: {
-          to: transaction.to, 
-          value: transaction.value ? new BigNumber(transaction.value).toFixed() : '0',
-          data: transaction.data, 
+          to: tx.to, 
+          value: tx.value ? new BigNumber(tx.value).toFixed() : '0',
+          data: tx.data, 
           from: userAddress,
-          gas: transaction.gasLimit ? new BigNumber(transaction.gasLimit).toFixed() : undefined
+          gas: tx.gasLimit ? new BigNumber(tx.gasLimit).toFixed() : undefined
         }
     };
 
@@ -318,10 +305,10 @@ app.use('/swap/v1', createProxyMiddleware({
   changeOrigin: true,
   logLevel: 'silent',
   filter: (pathname) => {
-    return !pathname.includes('providers/list') && !pathname.includes('quote') && !pathname.includes('build-tx') && !pathname.includes('check-support') && !pathname.includes('allowance');
+    return !pathname.includes('providers/list') && !pathname.includes('quote') && !pathname.includes('build-tx') && !pathname.includes('check-support');
   }
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo PRODUCTION Server v53 Running on ${PORT}`);
+  console.log(`Bitrabo PRODUCTION Server v54 Running on ${PORT}`);
 });
