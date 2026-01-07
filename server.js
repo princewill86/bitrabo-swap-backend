@@ -10,7 +10,6 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CONFIG
 const INTEGRATOR = process.env.BITRABO_INTEGRATOR || 'bitrabo';
 const FEE_PERCENT = Number(process.env.BITRABO_FEE || 0.0025); 
 
@@ -127,9 +126,6 @@ async function fetchLiFiQuotes(params) {
         logoURI: route.toToken.logoURI
       };
 
-      // Calculate Fee for Display
-      const feeValue = (parseFloat(fromAmountDecimal) * FEE_PERCENT).toFixed(6);
-
       return {
         info: {
           provider: 'SwapLifi',
@@ -140,7 +136,7 @@ async function fetchLiFiQuotes(params) {
         toTokenInfo,
         protocol: 'Swap',
         kind: 'sell',
-        fromAmount: params.fromTokenAmount, // Echo input exactly
+        fromAmount: params.fromTokenAmount, // Echo input strictly
         toAmount: toAmountDecimal,
         minToAmount: minToAmountDecimal,
         instantRate: new BigNumber(toAmountDecimal).div(params.fromTokenAmount).toString(),
@@ -156,27 +152,19 @@ async function fetchLiFiQuotes(params) {
         }, 
         
         fee: {
-          percentageFee: FEE_PERCENT * 100 // Display 0.25%
+          percentageFee: FEE_PERCENT * 100,
+          estimatedFeeFiatValue: 0.1 
         },
         
-        // --- GOLDEN KEY STRUCTURE FIX ---
-        // NO top-level 'name' or 'part'. Only 'subRoutes'.
-        // Use 'percent' as string "100".
+        // --- STRICT FIX: Matching v25 Mock Structure ---
+        // Using "part" (Number) instead of "percent" (String)
         routesData: [{
-            subRoutes: [[{ 
-                name: "Li.Fi", 
-                percent: "100", 
-                logo: "https://uni.onekey-asset.com/static/logo/lifi.png" 
-            }]]
+            name: "Li.Fi",
+            part: 100, 
+            subRoutes: [[{ name: "Li.Fi", part: 100, logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]]
         }],
         
-        // --- SAFE DEFAULTS FOR FEE INFO ---
-        oneKeyFeeExtraInfo: {
-            oneKeyFeeAmount: feeValue,
-            oneKeyFeeSymbol: fromTokenInfo.symbol || "ETH",
-            oneKeyFeeUsd: "0"
-        },
-        
+        oneKeyFeeExtraInfo: {}, // Keep empty to match working mock
         allowanceResult: null, 
         gasLimit: 500000,
         supportUrl: "https://help.onekey.so/hc/requests/new",
@@ -202,8 +190,10 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   try {
     const quotes = await fetchLiFiQuotes({ ...req.query, eventId });
     
+    // Header
     res.write(`data: ${JSON.stringify({ totalQuoteCount: quotes.length, eventId })}\n\n`);
     
+    // Slippage
     const slippageInfo = {
         autoSuggestedSlippage: 0.5,
         fromNetworkId: req.query.fromNetworkId,
@@ -214,6 +204,7 @@ app.get('/swap/v1/quote/events', async (req, res) => {
     };
     res.write(`data: ${JSON.stringify(slippageInfo)}\n\n`);
 
+    // Quotes
     for (const quote of quotes) {
         res.write(`data: ${JSON.stringify({ data: [quote] })}\n\n`);
     }
@@ -226,6 +217,7 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   }
 });
 
+// REAL BUILD-TX (Matching Golden Key Structure + Real Data)
 app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
   try {
     const { quoteResultCtx, userAddress } = req.body;
@@ -252,9 +244,11 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
             estimatedTime: 30,
             fee: { percentageFee: FEE_PERCENT * 100 }, 
             
-            // --- MATCH GOLDEN KEY HERE TOO ---
+            // --- STRICT MATCH to WORKING MOCK ---
             routesData: [{
-                subRoutes: [[{ name: "Li.Fi", percent: "100", logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]]
+                name: "Li.Fi",
+                part: 100,
+                subRoutes: [[{ name: "Li.Fi", part: 100, logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]]
             }],
             gasLimit: transaction.gasLimit ? Number(transaction.gasLimit) : 500000,
             slippage: 0.5,
@@ -290,5 +284,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo PRODUCTION Server v34 Running on ${PORT}`);
+  console.log(`Bitrabo PRODUCTION Server v35 Running on ${PORT}`);
 });
