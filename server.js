@@ -71,7 +71,20 @@ async function formatAmountOutput(chainId, tokenAddress, amountWei) {
     return ethers.formatUnits(amountWei, decimals).toString();
 }
 
-// REAL QUOTE LOGIC (v25 REPLICA)
+// --- SANITIZER (The Fix) ---
+function sanitizeDecimal(value, maxDecimals = 8) {
+    if (!value) return "0";
+    // Truncate to max decimals to prevent UI crash
+    if (value.includes('.')) {
+        const parts = value.split('.');
+        if (parts[1].length > maxDecimals) {
+            return `${parts[0]}.${parts[1].substring(0, maxDecimals)}`;
+        }
+    }
+    return value;
+}
+
+// REAL QUOTE LOGIC
 async function fetchLiFiQuotes(params) {
   try {
     const fromChain = parseInt(params.fromNetworkId.replace('evm--', ''));
@@ -103,12 +116,19 @@ async function fetchLiFiQuotes(params) {
     if (!routesResponse.routes || routesResponse.routes.length === 0) return [];
 
     return await Promise.all(routesResponse.routes.map(async (route, i) => {
-      const fromAmountDecimal = await formatAmountOutput(fromChain, route.fromToken.address, route.fromAmount);
-      const toAmountDecimal = await formatAmountOutput(toChain, route.toToken.address, route.toAmount);
+      // 1. Get raw amounts
+      const fromAmountDecimal = params.fromTokenAmount; 
+      const toAmountDecimalRaw = await formatAmountOutput(toChain, route.toToken.address, route.toAmount);
       
-      // Logic from v25: Simple float math for display values
+      // 2. SANITIZE OUTPUTS (Prevent precision errors)
+      const toAmountDecimal = sanitizeDecimal(toAmountDecimalRaw, 10);
+      
+      // 3. Simple math for Min Amount
       const minToAmountDecimal = (parseFloat(toAmountDecimal) * 0.995).toString(); 
-      const rate = new BigNumber(toAmountDecimal).div(fromAmountDecimal).toString();
+      
+      // 4. Rate calculation
+      const rateRaw = new BigNumber(toAmountDecimal).div(fromAmountDecimal).toString();
+      const rate = sanitizeDecimal(rateRaw, 10);
 
       if (i===0) console.log(`[✅ QUOTE] ${fromAmountDecimal} -> ${toAmountDecimal}`);
 
@@ -146,9 +166,8 @@ async function fetchLiFiQuotes(params) {
         toAmount: toAmountDecimal,
         minToAmount: minToAmountDecimal,
         instantRate: rate,
-        estimatedTime: 30, // v25 used fixed 30
+        estimatedTime: 30, 
         
-        // Pass FULL context to build-tx
         quoteResultCtx: { 
             lifiQuoteResultCtx: route,
             fromTokenInfo,
@@ -159,8 +178,7 @@ async function fetchLiFiQuotes(params) {
         }, 
         
         fee: {
-          percentageFee: FEE_PERCENT * 100, // Display 0.25
-          estimatedFeeFiatValue: 0.1 
+          percentageFee: FEE_PERCENT * 100
         },
         
         // v25 STRUCTURE (Verified Working)
@@ -196,10 +214,8 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   try {
     const quotes = await fetchLiFiQuotes({ ...req.query, eventId });
     
-    // Header
     res.write(`data: ${JSON.stringify({ totalQuoteCount: quotes.length, eventId })}\n\n`);
     
-    // Slippage
     const slippageInfo = {
         autoSuggestedSlippage: 0.5,
         fromNetworkId: req.query.fromNetworkId,
@@ -210,7 +226,6 @@ app.get('/swap/v1/quote/events', async (req, res) => {
     };
     res.write(`data: ${JSON.stringify(slippageInfo)}\n\n`);
 
-    // Quotes
     for (const quote of quotes) {
         res.write(`data: ${JSON.stringify({ data: [quote] })}\n\n`);
     }
@@ -223,7 +238,6 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   }
 });
 
-// REAL TRANSACTION BUILDER
 app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
   try {
     const { quoteResultCtx, userAddress } = req.body;
@@ -237,7 +251,6 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
 
     if (!transaction) throw new Error("Li.Fi failed to return transaction");
 
-    // v25 RESPONSE STRUCTURE
     const response = {
         result: { 
             info: { provider: 'SwapLifi', providerName: 'Li.fi (Bitrabo)', providerLogo: 'https://uni.onekey-asset.com/static/logo/lifi.png' },
@@ -251,7 +264,6 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
             estimatedTime: 30,
             fee: { percentageFee: FEE_PERCENT * 100 }, 
             
-            // v25 Structure
             routesData: [{
                 name: "Li.Fi Aggregator",
                 part: 100,
@@ -292,5 +304,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo PRODUCTION Server v39 Running on ${PORT}`);
+  console.log(`Bitrabo PRODUCTION Server v40 Running on ${PORT}`);
 });
