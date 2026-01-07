@@ -32,18 +32,19 @@ app.get(['/swap/v1/check-support', '/check-support'], (req, res) => {
   res.json(ok([{ status: 'available', networkId: req.query.networkId }]));
 });
 
-// FIX: Added 'protocols' to ensure frontend knows we support Swapping
+// Ensure provider ID matches exactly what we send in the quote
 app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
   res.json(ok([{
-    provider: 'lifi',
-    name: 'Bitrabo',
+    provider: 'lifi', 
+    name: 'Li.Fi (Bitrabo)',
     logoURI: 'https://raw.githubusercontent.com/lifinance/types/main/src/assets/logo.png',
     status: 'available',
     priority: 1,
-    protocols: ['swap'] 
+    protocols: ['swap']
   }]));
 });
 
+// Helper: Normalize Amount (Fixes decimal/atomic issues)
 async function normalizeAmount(chainId, tokenAddress, rawAmount) {
   if (!rawAmount || rawAmount === '0') return '0';
   try {
@@ -61,19 +62,19 @@ async function normalizeAmount(chainId, tokenAddress, rawAmount) {
   }
 }
 
+// --- QUOTE LOGIC ---
 async function fetchLiFiQuotes(params) {
   try {
     const fromChain = parseInt(params.fromNetworkId.replace('evm--', ''));
     const toChain = parseInt(params.toNetworkId.replace('evm--', ''));
     const fromToken = params.fromTokenAddress || '0x0000000000000000000000000000000000000000';
     const toToken = params.toTokenAddress || '0x0000000000000000000000000000000000000000';
-    const isNative = fromToken === '0x0000000000000000000000000000000000000000';
-
+    
     const amount = await normalizeAmount(fromChain, fromToken, params.fromTokenAmount);
     
     if(!amount || amount === '0') return [];
 
-    console.log(`[🔍 LIFI REQUEST] ${params.fromTokenAmount} (${amount}) ${fromToken} -> ${toToken}`);
+    console.log(`[🔍 LIFI REQUEST] ${params.fromTokenAmount} (${amount})`);
 
     const routesResponse = await getRoutes({
       fromChainId: fromChain,
@@ -94,43 +95,49 @@ async function fetchLiFiQuotes(params) {
       return [];
     }
 
-    console.log(`[✅ LIFI] Found ${routesResponse.routes.length} routes.`);
-
+    // Map and Strict Type Cast
     return routesResponse.routes.map((route, i) => {
       const isBest = i === 0;
       return {
         info: {
           provider: 'lifi',
-          providerName: 'Bitrabo',
+          providerName: 'Li.Fi (Bitrabo)',
           providerLogoURI: 'https://raw.githubusercontent.com/lifinance/types/main/src/assets/logo.png',
         },
         fromTokenInfo: {
           networkId: params.fromNetworkId,
           contractAddress: route.fromToken.address,
           symbol: route.fromToken.symbol,
-          decimals: route.fromToken.decimals
+          decimals: Number(route.fromToken.decimals), // Force Number
+          name: route.fromToken.name
         },
         toTokenInfo: {
           networkId: params.toNetworkId,
           contractAddress: route.toToken.address,
           symbol: route.toToken.symbol,
-          decimals: route.toToken.decimals
+          decimals: Number(route.toToken.decimals), // Force Number
+          name: route.toToken.name
         },
-        fromAmount: route.fromAmount,
-        toAmount: route.toAmount,
+        fromAmount: route.fromAmount.toString(), // Force String
+        toAmount: route.toAmount.toString(),     // Force String
         
-        // --- FIX IS HERE: minToAmount (OneKey) vs toAmountMin (LiFi) ---
-        minToAmount: route.toAmountMin, 
-        
+        // Critical: Mapped correctly now
+        minToAmount: route.toAmountMin.toString(), 
+        limit: null, // Explicitly not a limit order
+
         instantRate: new BigNumber(route.toAmount).div(route.fromAmount).toString(),
-        estimatedTime: route.toToken.chainId === route.fromToken.chainId ? 30 : 120,
+        
+        estimatedTime: Number(route.toToken.chainId === route.fromToken.chainId ? 30 : 120), // Force Number
+        
         kind: 'sell',
         isBest: isBest,
         receivedBest: isBest,
         quoteResultCtx: route, 
-        allowanceResult: isNative ? null : { isApproved: true },
         
-        // Ensure names exist to prevent UI crash
+        // Force NULL. This tells Frontend: "You figure out if approval is needed".
+        // This is safer than us guessing.
+        allowanceResult: null, 
+        
         routesData: route.steps.map(s => ({
             name: s.toolDetails?.name || s.tool || 'Swap',
             part: 100,
@@ -157,6 +164,10 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   try {
     const quotes = await fetchLiFiQuotes(req.query);
     const responsePayload = ok(quotes); 
+    
+    // DEBUG: Print the EXACT JSON we are sending
+    console.log("[📤 SENDING QUOTE]", JSON.stringify(responsePayload).substring(0, 200) + "..."); 
+
     res.write(`data: ${JSON.stringify(responsePayload)}\n\n`);
     res.write(`data: {"type":"done"}\n\n`);
   } catch (e) {
@@ -194,6 +205,9 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
   }
 });
 
+// ==================================================================
+// 2. PROXY FALLBACK
+// ==================================================================
 app.use('/swap/v1', createProxyMiddleware({
   target: 'https://swap.onekeycn.com',
   changeOrigin: true,
@@ -204,5 +218,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo Hybrid Server v12 Running on ${PORT}`);
+  console.log(`Bitrabo Hybrid Server v13 Running on ${PORT}`);
 });
