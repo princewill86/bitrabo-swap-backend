@@ -66,28 +66,33 @@ app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
   res.json(ok([providerData]));
 });
 
+// Helper: Get Decimals Securely
+async function getDecimals(chainId, tokenAddress) {
+    if (!tokenAddress || tokenAddress === '' || tokenAddress === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee') {
+        return 18;
+    }
+    try {
+        const token = await getToken(chainId, tokenAddress);
+        return token.decimals || 18;
+    } catch {
+        return 18; // Fallback
+    }
+}
+
 // Helper: Human Input -> Atomic Units
 async function normalizeAmountInput(chainId, tokenAddress, rawAmount) {
   if (!rawAmount || rawAmount === '0') return '0';
-  try {
-    if (!tokenAddress || tokenAddress === '' || tokenAddress === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee') {
-      return ethers.parseUnits(rawAmount, 18).toString();
-    }
-    const token = await getToken(chainId, tokenAddress);
-    if (token && token.decimals) {
-      const safeAmount = Number(rawAmount).toFixed(token.decimals);
-      return ethers.parseUnits(safeAmount, token.decimals).toString();
-    }
-    return ethers.parseUnits(rawAmount, 18).toString();
-  } catch (e) {
-    return rawAmount;
-  }
+  const decimals = await getDecimals(chainId, tokenAddress);
+  // Prevent "too many decimals" error by trimming string to max decimals
+  const safeAmount = Number(rawAmount).toFixed(decimals); 
+  return ethers.parseUnits(safeAmount, decimals).toString();
 }
 
-// Helper: Atomic Units -> Human Output (The missing piece!)
-function formatAmountOutput(amountWei, decimals) {
+// Helper: Atomic Units -> Human Output
+async function formatAmountOutput(chainId, tokenAddress, amountWei) {
     if(!amountWei) return "0";
-    return ethers.formatUnits(amountWei, decimals || 18).toString();
+    const decimals = await getDecimals(chainId, tokenAddress);
+    return ethers.formatUnits(amountWei, decimals).toString();
 }
 
 async function fetchLiFiQuotes(params) {
@@ -97,11 +102,11 @@ async function fetchLiFiQuotes(params) {
     const fromToken = params.fromTokenAddress || '0x0000000000000000000000000000000000000000';
     const toToken = params.toTokenAddress || '0x0000000000000000000000000000000000000000';
     
-    // Convert Input "1.5" -> "1500000..."
+    // Input Conversion
     const amount = await normalizeAmountInput(fromChain, fromToken, params.fromTokenAmount);
     if(!amount || amount === '0') return [];
 
-    console.log(`[🔍 LIFI] Requesting ${amount} on Chain ${fromChain}`);
+    console.log(`[🔍 LIFI] Requesting ${amount} atomic units on Chain ${fromChain}`);
 
     const routesResponse = await getRoutes({
       fromChainId: fromChain,
@@ -119,11 +124,15 @@ async function fetchLiFiQuotes(params) {
 
     if (!routesResponse.routes || routesResponse.routes.length === 0) return [];
 
-    return routesResponse.routes.map((route, i) => {
-      // 1. Convert Amounts back to Decimals for OneKey
-      const fromAmountDecimal = formatAmountOutput(route.fromAmount, route.fromToken.decimals);
-      const toAmountDecimal = formatAmountOutput(route.toAmount, route.toToken.decimals);
-      const minToAmountDecimal = formatAmountOutput(route.toAmountMin, route.toToken.decimals);
+    // Map Routes Asynchronously (to wait for decimal fetching)
+    return await Promise.all(routesResponse.routes.map(async (route, i) => {
+      // 1. Convert Amounts back to Decimals CORRECTLY
+      const fromAmountDecimal = await formatAmountOutput(fromChain, route.fromToken.address, route.fromAmount);
+      const toAmountDecimal = await formatAmountOutput(toChain, route.toToken.address, route.toAmount);
+      const minToAmountDecimal = await formatAmountOutput(toChain, route.toToken.address, route.toAmountMin);
+
+      // Debug Log
+      if(i === 0) console.log(`[✅ QUOTE] ${fromAmountDecimal} -> ${toAmountDecimal}`);
 
       return {
         info: {
@@ -152,30 +161,23 @@ async function fetchLiFiQuotes(params) {
         protocol: 'Swap',
         kind: 'sell',
         
-        // 2. Send DECIMALS (Human readable)
+        // 2. Send Correct Human Decimals
         fromAmount: fromAmountDecimal,
         toAmount: toAmountDecimal,
         minToAmount: minToAmountDecimal,
         
-        // 3. Calculate Correct Rate (Decimal / Decimal)
         instantRate: new BigNumber(toAmountDecimal).div(fromAmountDecimal).toString(),
-        
         estimatedTime: route.toToken.chainId === route.fromToken.chainId ? 30 : 120,
-        quoteResultCtx: { lifiQuoteResultCtx: route }, // Keep context raw
+        quoteResultCtx: { lifiQuoteResultCtx: route }, 
         
         fee: {
           percentageFee: Number(process.env.BITRABO_FEE || 0.0025),
-          estimatedFeeFiatValue: 0.1
+          estimatedFeeFiatValue: 0.1,
+          protocolFees: 0 // Satisfies Spy Log structure
         },
         
-        routesData: route.steps.map(s => ({
-            name: s.toolDetails?.name || s.tool || 'Swap',
-            part: 100,
-            subRoutes: [[{ name: s.toolDetails?.name || s.tool || 'Swap', part: 100 }]] 
-        })),
-        
-        // Explicitly null allowance to force frontend logic
-        allowanceResult: null, 
+        routesData: [], // Match Spy Log (Empty for LiFi)
+        allowanceResult: null, // Force frontend logic
         
         gasLimit: 500000,
         oneKeyFeeExtraInfo: {},
@@ -183,7 +185,7 @@ async function fetchLiFiQuotes(params) {
         quoteId: uuidv4(),
         eventId: params.eventId
       };
-    });
+    }));
   } catch (e) {
     console.error("Quote Logic Error:", e.message);
     return [];
@@ -201,11 +203,9 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   try {
     const quotes = await fetchLiFiQuotes({ ...req.query, eventId });
     
-    // 1. HEADER
     const header = { totalQuoteCount: quotes.length, eventId: eventId };
     res.write(`data: ${JSON.stringify(header)}\n\n`);
 
-    // 2. SLIPPAGE
     const slippageInfo = {
         autoSuggestedSlippage: 0.5,
         fromNetworkId: req.query.fromNetworkId,
@@ -216,7 +216,6 @@ app.get('/swap/v1/quote/events', async (req, res) => {
     };
     res.write(`data: ${JSON.stringify(slippageInfo)}\n\n`);
 
-    // 3. QUOTES
     for (const quote of quotes) {
         const payload = { data: [quote] }; 
         res.write(`data: ${JSON.stringify(payload)}\n\n`);
@@ -268,5 +267,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo Hybrid Server v15 Running on ${PORT}`);
+  console.log(`Bitrabo Hybrid Server v16 Running on ${PORT}`);
 });
