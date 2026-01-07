@@ -14,7 +14,7 @@ const PORT = process.env.PORT || 3000;
 const INTEGRATOR = process.env.BITRABO_INTEGRATOR || 'bitrabo';
 const FEE_RECEIVER = process.env.BITRABO_FEE_RECEIVER; 
 const FEE_PERCENT = Number(process.env.BITRABO_FEE || 0.0025); 
-const LIFI_ROUTER_ADDRESS = "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE"; // Li.Fi Router
+const LIFI_ROUTER_ADDRESS = "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE"; 
 
 createConfig({
   integrator: INTEGRATOR,
@@ -35,7 +35,6 @@ app.use((req, res, next) => {
 // 1. HELPERS
 // ==================================================================
 
-// CRITICAL: Native tokens MUST be empty string for OneKey
 function formatTokenAddress(address, isNative) {
     if (isNative) return "";
     if (!address || address === '0x0000000000000000000000000000000000000000') return "";
@@ -124,8 +123,8 @@ async function fetchLiFiQuotes(params) {
       const toAmountDecimal = await formatAmountOutput(toChain, route.toToken.address, route.toAmount);
       
       const toAmountBN = new BigNumber(toAmountDecimal);
-      const minToAmountDecimal = toAmountBN.multipliedBy(0.995).toString();
-      const rate = toAmountBN.dividedBy(fromAmountDecimal).toString();
+      const minToAmountDecimal = toAmountBN.multipliedBy(0.995).toFixed();
+      const rate = toAmountBN.dividedBy(fromAmountDecimal).toFixed();
 
       if (i===0) console.log(`[✅ QUOTE] ${fromAmountDecimal} -> ${toAmountDecimal}`);
 
@@ -153,13 +152,12 @@ async function fetchLiFiQuotes(params) {
         logoURI: route.toToken.logoURI
       };
 
-      // --- ALLOWANCE LOGIC ---
-      // If selling a Token (not native), provide Mock Allowance to bypass spinner
+      // --- EXACT AMOUNT ALLOWANCE FIX ---
       let allowanceResult = null;
       if (!isFromNative) {
           allowanceResult = {
               allowanceTarget: LIFI_ROUTER_ADDRESS,
-              amount: "115792089237316195423570985008687907853269984665640564039457584007913129639935", // Max Int
+              amount: fromAmountDecimal, // Exact amount required
               shouldResetApprove: false
           };
       }
@@ -174,6 +172,7 @@ async function fetchLiFiQuotes(params) {
         toTokenInfo,
         protocol: 'Swap',
         kind: 'sell',
+        
         fromAmount: fromAmountDecimal,
         toAmount: toAmountDecimal,
         minToAmount: minToAmountDecimal,
@@ -194,7 +193,7 @@ async function fetchLiFiQuotes(params) {
           estimatedFeeFiatValue: 0.1 
         },
         
-        // Strict Structure (Matching Mock v25)
+        // Structure matches Working Mock v25
         routesData: [{
             name: "Li.Fi Aggregator",
             part: 100,
@@ -202,7 +201,7 @@ async function fetchLiFiQuotes(params) {
         }],
         
         oneKeyFeeExtraInfo: {},
-        allowanceResult, // Injected conditionally
+        allowanceResult,
         gasLimit: 500000,
         supportUrl: "https://help.onekey.so/hc/requests/new",
         quoteId: uuidv4(),
@@ -251,7 +250,7 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   }
 });
 
-// BUILD-TX (Fetches Tx from Stored Route)
+// BUILD-TX
 app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
   try {
     const { quoteResultCtx, userAddress } = req.body;
@@ -317,5 +316,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo PRODUCTION Server v49 Running on ${PORT}`);
+  console.log(`Bitrabo PRODUCTION Server v50 Running on ${PORT}`);
 });
