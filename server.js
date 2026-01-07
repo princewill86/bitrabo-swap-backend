@@ -18,7 +18,6 @@ app.use(cors({ origin: '*' }));
 const jsonParser = express.json();
 const ok = (data) => ({ code: 0, data });
 
-// --- LOGGING ---
 app.use((req, res, next) => {
   const isHijack = req.url.includes('quote') || req.url.includes('providers') || req.url.includes('check-support');
   console.log(isHijack ? `[⚡ HIJACK] ${req.method} ${req.url}` : `[🔄 PROXY] ${req.method} ${req.url}`);
@@ -33,17 +32,18 @@ app.get(['/swap/v1/check-support', '/check-support'], (req, res) => {
   res.json(ok([{ status: 'available', networkId: req.query.networkId }]));
 });
 
+// FIX: Added 'protocols' to ensure frontend knows we support Swapping
 app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
   res.json(ok([{
     provider: 'lifi',
     name: 'Bitrabo',
     logoURI: 'https://raw.githubusercontent.com/lifinance/types/main/src/assets/logo.png',
     status: 'available',
-    priority: 1
+    priority: 1,
+    protocols: ['swap'] 
   }]));
 });
 
-// --- HELPER: Normalize Amount ---
 async function normalizeAmount(chainId, tokenAddress, rawAmount) {
   if (!rawAmount || rawAmount === '0') return '0';
   try {
@@ -61,15 +61,12 @@ async function normalizeAmount(chainId, tokenAddress, rawAmount) {
   }
 }
 
-// --- QUOTE LOGIC ---
 async function fetchLiFiQuotes(params) {
   try {
     const fromChain = parseInt(params.fromNetworkId.replace('evm--', ''));
     const toChain = parseInt(params.toNetworkId.replace('evm--', ''));
     const fromToken = params.fromTokenAddress || '0x0000000000000000000000000000000000000000';
     const toToken = params.toTokenAddress || '0x0000000000000000000000000000000000000000';
-    
-    // Check if Native Token (ETH, MATIC, BNB)
     const isNative = fromToken === '0x0000000000000000000000000000000000000000';
 
     const amount = await normalizeAmount(fromChain, fromToken, params.fromTokenAmount);
@@ -121,23 +118,23 @@ async function fetchLiFiQuotes(params) {
         },
         fromAmount: route.fromAmount,
         toAmount: route.toAmount,
-        toAmountMin: route.toAmountMin,
+        
+        // --- FIX IS HERE: minToAmount (OneKey) vs toAmountMin (LiFi) ---
+        minToAmount: route.toAmountMin, 
+        
         instantRate: new BigNumber(route.toAmount).div(route.fromAmount).toString(),
         estimatedTime: route.toToken.chainId === route.fromToken.chainId ? 30 : 120,
         kind: 'sell',
         isBest: isBest,
         receivedBest: isBest,
         quoteResultCtx: route, 
+        allowanceResult: isNative ? null : { isApproved: true },
         
-        // --- CRITICAL FIX IS HERE ---
-        // Only send allowanceResult if it's NOT native token.
-        // If we send this for ETH, OneKey tries to "Approve ETH" and fails.
-        allowanceResult: isNative ? null : { isApproved: true }, 
-        
+        // Ensure names exist to prevent UI crash
         routesData: route.steps.map(s => ({
-            name: s.toolDetails.name,
+            name: s.toolDetails?.name || s.tool || 'Swap',
             part: 100,
-            subRoutes: [[{ name: s.toolDetails.name, part: 100 }]] 
+            subRoutes: [[{ name: s.toolDetails?.name || s.tool || 'Swap', part: 100 }]] 
         })),
         fee: {
           percentageFee: Number(process.env.BITRABO_FEE || 0.0025),
@@ -197,9 +194,6 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
   }
 });
 
-// ==================================================================
-// 2. PROXY FALLBACK
-// ==================================================================
 app.use('/swap/v1', createProxyMiddleware({
   target: 'https://swap.onekeycn.com',
   changeOrigin: true,
@@ -210,5 +204,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo Hybrid Server v11 Running on ${PORT}`);
+  console.log(`Bitrabo Hybrid Server v12 Running on ${PORT}`);
 });
