@@ -10,9 +10,14 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// --- CONFIGURATION ---
+const INTEGRATOR = process.env.BITRABO_INTEGRATOR || 'bitrabo';
+const FEE_RECEIVER = process.env.BITRABO_FEE_RECEIVER; // MUST BE SET IN RENDER
+const FEE_PERCENT = Number(process.env.BITRABO_FEE || 0.0025); // 0.0025 = 0.25%
+
 createConfig({
-  integrator: process.env.BITRABO_INTEGRATOR || 'bitrabo',
-  fee: Number(process.env.BITRABO_FEE || 0.0025),
+  integrator: INTEGRATOR,
+  fee: FEE_PERCENT,
 });
 
 app.use(cors({ origin: '*' }));
@@ -33,7 +38,6 @@ app.get(['/swap/v1/check-support', '/check-support'], (req, res) => {
   res.json(ok([{ status: 'available', networkId: req.query.networkId }]));
 });
 
-// Hijack Provider List to ensure LiFi is selected
 app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
   res.json(ok([{
     provider: 'SwapLifi',
@@ -69,7 +73,6 @@ async function formatAmountOutput(chainId, tokenAddress, amountWei) {
     return ethers.formatUnits(amountWei, decimals).toString();
 }
 
-// REAL QUOTE LOGIC
 async function fetchLiFiQuotes(params) {
   try {
     const fromChain = parseInt(params.fromNetworkId.replace('evm--', ''));
@@ -83,7 +86,7 @@ async function fetchLiFiQuotes(params) {
     const amount = await normalizeAmountInput(fromChain, fromToken, params.fromTokenAmount);
     if(!amount || amount === '0') return [];
 
-    console.log(`[🔍 LIFI] Requesting ${amount} atomic units on Chain ${fromChain}`);
+    console.log(`[🔍 LIFI] Requesting ${amount} atomic units (Fee: ${FEE_PERCENT})`);
 
     const routesResponse = await getRoutes({
       fromChainId: fromChain,
@@ -92,10 +95,11 @@ async function fetchLiFiQuotes(params) {
       toTokenAddress: toToken,
       fromAmount: amount,
       fromAddress: params.userAddress,
-      slippage: Number(params.slippagePercentage || 0.5) / 100,
+      slippage: Number(params.slippagePercentage || 0.5) / 100, // LiFi expects 0.005 for 0.5%
       options: {
-        integrator: process.env.BITRABO_INTEGRATOR || 'bitrabo',
-        fee: Number(process.env.BITRABO_FEE || 0.0025),
+        integrator: INTEGRATOR,
+        fee: FEE_PERCENT,
+        referrer: FEE_RECEIVER // <--- CRITICAL: Forces fee to this address
       }
     });
 
@@ -106,9 +110,9 @@ async function fetchLiFiQuotes(params) {
       const toAmountDecimal = await formatAmountOutput(toChain, route.toToken.address, route.toAmount);
       const minToAmountDecimal = await formatAmountOutput(toChain, route.toToken.address, route.toAmountMin);
 
-      if (i===0) console.log(`[✅ QUOTE] ${fromAmountDecimal} -> ${toAmountDecimal}`);
+      if(i===0) console.log(`[✅ QUOTE] ${fromAmountDecimal} -> ${toAmountDecimal}`);
 
-      // Construct Token Info Objects
+      // Token Info Objects
       const fromTokenInfo = {
         contractAddress: isNativeSell ? '' : route.fromToken.address,
         networkId: params.fromNetworkId,
@@ -145,7 +149,6 @@ async function fetchLiFiQuotes(params) {
         instantRate: new BigNumber(toAmountDecimal).div(fromAmountDecimal).toString(),
         estimatedTime: route.toToken.chainId === route.fromToken.chainId ? 30 : 120,
         
-        // Pass FULL context to build-tx
         quoteResultCtx: { 
             lifiQuoteResultCtx: route,
             fromTokenInfo,
@@ -156,14 +159,14 @@ async function fetchLiFiQuotes(params) {
         }, 
         
         fee: {
-          percentageFee: 0.25, // Display 0.25%
+          percentageFee: FEE_PERCENT * 100, // Display human percentage (0.25)
           estimatedFeeFiatValue: 0.1 
         },
         
         routesData: [{
-            name: "Li.Fi Aggregator",
+            name: "Li.Fi",
             part: 100,
-            subRoutes: [[{ name: route.steps[0]?.toolDetails?.name || "Li.Fi", part: 100, logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]]
+            subRoutes: [[{ name: "Li.Fi", part: 100, logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]]
         }],
         
         allowanceResult: null, 
@@ -191,10 +194,8 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   try {
     const quotes = await fetchLiFiQuotes({ ...req.query, eventId });
     
-    // 1. Header
     res.write(`data: ${JSON.stringify({ totalQuoteCount: quotes.length, eventId })}\n\n`);
     
-    // 2. Slippage
     const slippageInfo = {
         autoSuggestedSlippage: 0.5,
         fromNetworkId: req.query.fromNetworkId,
@@ -205,7 +206,6 @@ app.get('/swap/v1/quote/events', async (req, res) => {
     };
     res.write(`data: ${JSON.stringify(slippageInfo)}\n\n`);
 
-    // 3. Quotes
     for (const quote of quotes) {
         res.write(`data: ${JSON.stringify({ data: [quote] })}\n\n`);
     }
@@ -218,7 +218,7 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   }
 });
 
-// --- REAL TRANSACTION BUILDER ---
+// REAL TRANSACTION BUILDER
 app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
   try {
     const { quoteResultCtx, userAddress } = req.body;
@@ -226,14 +226,12 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
 
     if (!route || !route.steps) return res.json(ok(null));
 
-    // 1. Fetch REAL Transaction from Li.Fi
     console.log("[⚙️ BUILD-TX] Fetching Li.Fi Transaction...");
     const step = route.steps[0];
     const transaction = await getStepTransaction(step); 
 
     if (!transaction) throw new Error("Li.Fi failed to return transaction");
 
-    // 2. Construct Response matching Golden Key
     const response = {
         result: { 
             info: { provider: 'SwapLifi', providerName: 'Li.fi (Bitrabo)', providerLogo: 'https://uni.onekey-asset.com/static/logo/lifi.png' },
@@ -245,7 +243,7 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
             toAmount: quoteResultCtx.toAmount,
             instantRate: quoteResultCtx.instantRate,
             estimatedTime: 30,
-            fee: { percentageFee: 0.25 },
+            fee: { percentageFee: FEE_PERCENT * 100 }, // Display correctly
             routesData: [{
                 name: "Li.Fi",
                 part: 100,
@@ -286,5 +284,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo PRODUCTION Server v26 Running on ${PORT}`);
+  console.log(`Bitrabo PRODUCTION Server v27 Running on ${PORT}`);
 });
