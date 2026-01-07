@@ -4,7 +4,7 @@ const cors = require('cors');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const BigNumber = require('bignumber.js');
 const { ethers } = require('ethers');
-const { createConfig, getToken } = require('@lifi/sdk'); // Removed getRoutes
+const { createConfig, getToken } = require('@lifi/sdk'); 
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
@@ -19,8 +19,10 @@ app.use(cors({ origin: '*' }));
 const jsonParser = express.json();
 const ok = (data) => ({ code: 0, message: "Success", data });
 
+// --- LOGGING ---
 app.use((req, res, next) => {
-  const isHijack = req.url.includes('quote') || req.url.includes('providers') || req.url.includes('check-support');
+  // Added 'build-tx' to this list so logs are accurate
+  const isHijack = req.url.includes('quote') || req.url.includes('providers') || req.url.includes('check-support') || req.url.includes('build-tx');
   console.log(isHijack ? `[⚡ HIJACK] ${req.method} ${req.url}` : `[🔄 PROXY] ${req.method} ${req.url}`);
   next();
 });
@@ -35,7 +37,7 @@ app.get(['/swap/v1/check-support', '/check-support'], (req, res) => {
 
 app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
   res.json(ok([{
-    provider: 'SwapLifi', // Must match quote provider
+    provider: 'SwapLifi',
     name: 'Li.fi (Bitrabo)',
     logoURI: 'https://uni.onekey-asset.com/static/logo/lifi.png',
     status: 'available',
@@ -44,30 +46,33 @@ app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
   }]));
 });
 
-// Helper: Get Decimals
-async function getDecimals(chainId, tokenAddress) {
-    if (!tokenAddress || tokenAddress === '' || tokenAddress === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee') return 18;
-    try {
-        const token = await getToken(chainId, tokenAddress);
-        return token.decimals || 18;
-    } catch { return 18; }
-}
-
+// Mock Logic
 async function fetchMockQuotes(params) {
   try {
     const fromChain = parseInt(params.fromNetworkId.replace('evm--', ''));
-    const toChain = parseInt(params.toNetworkId.replace('evm--', ''));
     const fromToken = params.fromTokenAddress || '0x0000000000000000000000000000000000000000';
     const toToken = params.toTokenAddress || '0x0000000000000000000000000000000000000000';
     
-    // 1. Calculate Mock Amounts
+    // Detect Swap Direction
+    // If fromToken is Native (Empty/Zero), we are selling ETH -> Buying Stable
+    // If fromToken is NOT Native, we assume Selling Stable -> Buying ETH
+    const isNativeSell = (!fromToken || fromToken === '' || fromToken === '0x0000000000000000000000000000000000000000' || fromToken === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee');
+
     const fromAmountRaw = params.fromTokenAmount || "1";
-    const rate = 3250.5; // Mock Rate: 1 Token = 3250 USDC
-    const toAmountRaw = (parseFloat(fromAmountRaw) * rate).toFixed(6); 
+    let rate, toAmountRaw;
 
-    console.log(`[⚠️ MOCK MODE] Returning fake quote: ${fromAmountRaw} -> ${toAmountRaw}`);
+    if (isNativeSell) {
+        // ETH -> USDC (Price ~3250)
+        rate = 3250.5;
+        toAmountRaw = (parseFloat(fromAmountRaw) * rate).toFixed(6); 
+    } else {
+        // USDC -> ETH (Price ~1/3250)
+        rate = 1 / 3250.5; 
+        toAmountRaw = (parseFloat(fromAmountRaw) * rate).toFixed(18); 
+    }
 
-    // 2. Construct Perfect OneKey Object (Based on Spy Logs)
+    console.log(`[⚠️ MOCK SMART] ${fromAmountRaw} (${isNativeSell ? 'ETH' : 'TOKEN'}) -> ${toAmountRaw} (${isNativeSell ? 'USDC' : 'ETH'})`);
+
     const quote = {
       info: {
         provider: 'SwapLifi',
@@ -75,39 +80,34 @@ async function fetchMockQuotes(params) {
         providerName: 'Li.fi (Bitrabo)',
       },
       fromTokenInfo: {
-        contractAddress: fromToken === '0x0000000000000000000000000000000000000000' ? '' : fromToken,
+        contractAddress: isNativeSell ? '' : fromToken,
         networkId: params.fromNetworkId,
-        isNative: fromToken === '0x0000000000000000000000000000000000000000',
-        decimals: 18,
-        name: "Mock Token",
-        symbol: "MOCK",
+        isNative: isNativeSell,
+        decimals: isNativeSell ? 18 : 6, // Assume 6 for stables
+        name: isNativeSell ? "Ethereum" : "Stablecoin",
+        symbol: isNativeSell ? "ETH" : "USDT",
         logoURI: "https://uni.onekey-asset.com/static/chain/eth.png"
       },
       toTokenInfo: {
-        contractAddress: toToken === '0x0000000000000000000000000000000000000000' ? '' : toToken,
+        contractAddress: isNativeSell ? toToken : '',
         networkId: params.toNetworkId,
-        isNative: toToken === '0x0000000000000000000000000000000000000000',
-        decimals: 6,
-        name: "Mock Output",
-        symbol: "USDC",
+        isNative: !isNativeSell,
+        decimals: isNativeSell ? 6 : 18,
+        name: isNativeSell ? "USD Coin" : "Ethereum",
+        symbol: isNativeSell ? "USDC" : "ETH",
         logoURI: "https://uni.onekey-asset.com/static/chain/eth.png"
       },
       protocol: 'Swap',
       kind: 'sell',
       
-      // Strings required
       fromAmount: fromAmountRaw.toString(),
       toAmount: toAmountRaw.toString(),
-      minToAmount: (parseFloat(toAmountRaw) * 0.99).toString(), // 1% slippage
+      minToAmount: (parseFloat(toAmountRaw) * 0.99).toString(),
       
       instantRate: rate.toString(),
       estimatedTime: 30,
       
-      // Dummy context for build-tx
-      quoteResultCtx: { 
-          mock: true, 
-          fromAmount: fromAmountRaw 
-      },
+      quoteResultCtx: { mock: true, fromAmount: fromAmountRaw },
       
       fee: {
         percentageFee: Number(process.env.BITRABO_FEE || 0.0025),
@@ -120,7 +120,7 @@ async function fetchMockQuotes(params) {
           subRoutes: [[{ name: "Li.Fi", part: 100 }]]
       }],
       
-      allowanceResult: null, // Force frontend logic
+      allowanceResult: null,
       gasLimit: 500000,
       oneKeyFeeExtraInfo: {},
       supportUrl: "https://help.onekey.so/hc/requests/new",
@@ -175,19 +175,19 @@ app.get('/swap/v1/quote/events', async (req, res) => {
 // Mock Build Tx - Allows clicking "Swap"
 app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
   const { userAddress } = req.body;
-  // Return a dummy self-transfer so user can see the Review Screen
   res.json(ok({
     result: { info: { provider: 'SwapLifi', providerName: 'Li.Fi (Bitrabo)' } },
     tx: {
-      to: userAddress, // Self transfer
+      to: userAddress,
       value: "0",
-      data: "0x", // Empty data
+      data: "0x",
       from: userAddress,
       gas: "21000"
     }
   }));
 });
 
+// Proxy Fallback
 app.use('/swap/v1', createProxyMiddleware({
   target: 'https://swap.onekeycn.com',
   changeOrigin: true,
@@ -198,5 +198,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo MOCK Server v17 Running on ${PORT}`);
+  console.log(`Bitrabo SMART MOCK Server v18 Running on ${PORT}`);
 });
