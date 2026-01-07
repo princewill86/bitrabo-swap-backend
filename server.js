@@ -18,7 +18,6 @@ app.use(cors({ origin: '*' }));
 const jsonParser = express.json();
 const ok = (data) => ({ code: 0, data });
 
-// --- LOGGING ---
 app.use((req, res, next) => {
   const isHijack = req.url.includes('quote') || req.url.includes('providers') || req.url.includes('check-support');
   console.log(isHijack ? `[⚡ HIJACK] ${req.method} ${req.url}` : `[🔄 PROXY] ${req.method} ${req.url}`);
@@ -43,33 +42,25 @@ app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
   }]));
 });
 
-// --- CRITICAL FIX: ALWAYS FETCH DECIMALS ---
+// --- HELPER: Normalize Amount ---
 async function normalizeAmount(chainId, tokenAddress, rawAmount) {
   if (!rawAmount || rawAmount === '0') return '0';
-
   try {
-    // 1. Handle Native Token (ETH/BNB/MATIC) -> Always 18 decimals
     if (!tokenAddress || tokenAddress === '' || tokenAddress === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee') {
       return ethers.parseUnits(rawAmount, 18).toString();
     }
-    
-    // 2. Handle ERC20 -> Must fetch decimals (USDT=6, WBTC=8, etc)
     const token = await getToken(chainId, tokenAddress);
     if (token && token.decimals) {
-      // Fix potential "too many decimals" error (e.g. user types 1.1234567 for USDT)
       const safeAmount = Number(rawAmount).toFixed(token.decimals);
       return ethers.parseUnits(safeAmount, token.decimals).toString();
     }
-    
-    // 3. Fallback -> Assume 18 if fetch fails
     return ethers.parseUnits(rawAmount, 18).toString();
   } catch (e) {
-    console.error("Amount Normalization Failed:", e);
-    // If conversion fails, pass raw as last resort (risky but better than crash)
     return rawAmount;
   }
 }
 
+// --- QUOTE LOGIC ---
 async function fetchLiFiQuotes(params) {
   try {
     const fromChain = parseInt(params.fromNetworkId.replace('evm--', ''));
@@ -77,12 +68,11 @@ async function fetchLiFiQuotes(params) {
     const fromToken = params.fromTokenAddress || '0x0000000000000000000000000000000000000000';
     const toToken = params.toTokenAddress || '0x0000000000000000000000000000000000000000';
     
-    // Convert "5" USDT -> "5000000"
     const amount = await normalizeAmount(fromChain, fromToken, params.fromTokenAmount);
     
     if(!amount || amount === '0') return [];
 
-    console.log(`[🔍 LIFI REQUEST] ${params.fromTokenAmount} (${amount} atomic) of ${fromToken} on Chain ${fromChain}`);
+    console.log(`[🔍 LIFI REQUEST] ${params.fromTokenAmount} (${amount}) ${fromToken} -> ${toToken}`);
 
     const routesResponse = await getRoutes({
       fromChainId: fromChain,
@@ -102,6 +92,8 @@ async function fetchLiFiQuotes(params) {
       console.log(`[⚠️ LIFI] No routes found.`);
       return [];
     }
+
+    console.log(`[✅ LIFI] Found ${routesResponse.routes.length} routes.`);
 
     return routesResponse.routes.map((route, i) => {
       const isBest = i === 0;
@@ -127,7 +119,7 @@ async function fetchLiFiQuotes(params) {
         toAmount: route.toAmount,
         toAmountMin: route.toAmountMin,
         instantRate: new BigNumber(route.toAmount).div(route.fromAmount).toString(),
-        estimatedTime: route.toToken.chainId === route.fromToken.chainId ? 30 : 120, // 30s for same chain, 2m for cross
+        estimatedTime: route.toToken.chainId === route.fromToken.chainId ? 30 : 120,
         kind: 'sell',
         isBest: isBest,
         receivedBest: isBest,
@@ -158,7 +150,11 @@ app.get('/swap/v1/quote/events', async (req, res) => {
 
   try {
     const quotes = await fetchLiFiQuotes(req.query);
-    res.write(`data: ${JSON.stringify(quotes)}\n\n`);
+    
+    // --- FIX IS HERE: Wrap the array in 'ok()' ---
+    const responsePayload = ok(quotes); 
+    
+    res.write(`data: ${JSON.stringify(responsePayload)}\n\n`);
     res.write(`data: {"type":"done"}\n\n`);
   } catch (e) {
     res.write(`data: {"type":"error"}\n\n`);
@@ -208,5 +204,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo Hybrid Server v9 Running on ${PORT}`);
+  console.log(`Bitrabo Hybrid Server v10 Running on ${PORT}`);
 });
