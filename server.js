@@ -34,14 +34,14 @@ app.use((req, res, next) => {
 // 1. HELPERS
 // ==================================================================
 
-// FIX: Native Tokens must have EMPTY STRING address in Response
+// Helper: Ensure Native Tokens are "" (Required by OneKey)
 function formatTokenAddress(address, isNative) {
     if (isNative) return "";
-    return address ? address.toLowerCase() : "";
+    if (!address || address === '0x0000000000000000000000000000000000000000') return "";
+    return address.toLowerCase();
 }
 
 async function getDecimals(chainId, tokenAddress) {
-    // If empty or 0x000... or 0xeee..., it's native (18 decimals usually)
     if (!tokenAddress || tokenAddress === '' || 
         tokenAddress === '0x0000000000000000000000000000000000000000' || 
         tokenAddress.toLowerCase() === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee') {
@@ -121,22 +121,23 @@ async function fetchLiFiQuotes(params) {
     if (!routesResponse.routes || routesResponse.routes.length === 0) return [];
 
     return await Promise.all(routesResponse.routes.map(async (route, i) => {
-      const fromAmountDecimal = params.fromTokenAmount; // Echo Input
+      const fromAmountDecimal = params.fromTokenAmount;
       const toAmountDecimal = await formatAmountOutput(toChain, route.toToken.address, route.toAmount);
       
+      // STRICT MATH (From v42)
       const toAmountBN = new BigNumber(toAmountDecimal);
       const minToAmountDecimal = toAmountBN.multipliedBy(0.995).toString();
       const rate = toAmountBN.dividedBy(fromAmountDecimal).toString();
 
       if (i===0) console.log(`[✅ QUOTE] ${fromAmountDecimal} -> ${toAmountDecimal}`);
 
-      // Determine IsNative for Response
+      // ADDRESS NORMALIZATION (From v42)
       const isFromNative = isNativeSell;
       const isToNative = route.toToken.address === '0x0000000000000000000000000000000000000000' || 
                          route.toToken.address.toLowerCase() === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
 
       const fromTokenInfo = {
-        contractAddress: formatTokenAddress(route.fromToken.address, isFromNative), // FIX APPLIED HERE
+        contractAddress: formatTokenAddress(route.fromToken.address, isFromNative),
         networkId: params.fromNetworkId,
         isNative: isFromNative,
         decimals: route.fromToken.decimals,
@@ -146,7 +147,7 @@ async function fetchLiFiQuotes(params) {
       };
 
       const toTokenInfo = {
-        contractAddress: formatTokenAddress(route.toToken.address, isToNative), // FIX APPLIED HERE
+        contractAddress: formatTokenAddress(route.toToken.address, isToNative),
         networkId: params.toNetworkId,
         isNative: isToNative,
         decimals: route.toToken.decimals,
@@ -181,10 +182,11 @@ async function fetchLiFiQuotes(params) {
         }, 
         
         fee: {
-          percentageFee: FEE_PERCENT * 100
+          percentageFee: FEE_PERCENT * 100,
+          estimatedFeeFiatValue: 0.1 // REQUIRED FIELD (Restored from v39)
         },
         
-        // Structure matches Working Mock v25
+        // STRICT MOCK STRUCTURE (Restored from v25/v39)
         routesData: [{
             name: "Li.Fi",
             part: 100,
@@ -308,5 +310,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo PRODUCTION Server v42 Running on ${PORT}`);
+  console.log(`Bitrabo PRODUCTION Server v43 Running on ${PORT}`);
 });
