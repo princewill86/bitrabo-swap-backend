@@ -1,8 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { createProxyMiddleware, responseInterceptor } = require('http-proxy-middleware');
 const axios = require('axios');
+const { createProxyMiddleware, responseInterceptor } = require('http-proxy-middleware');
 const BigNumber = require('bignumber.js');
 const { ethers } = require('ethers');
 const { createConfig, getRoutes, getToken, getStepTransaction } = require('@lifi/sdk');
@@ -24,38 +24,7 @@ const jsonParser = express.json();
 const ok = (data) => ({ code: 0, message: "Success", data });
 
 // ==================================================================
-// 1. HELPERS
-// ==================================================================
-function formatTokenAddress(address, isNative) {
-    if (isNative) return "";
-    if (!address || address === '0x0000000000000000000000000000000000000000') return "";
-    return address.toLowerCase();
-}
-
-async function normalizeAmountInput(chainId, tokenAddress, rawAmount) {
-  if (!rawAmount || rawAmount === '0') return '0';
-  try {
-      const token = await getToken(chainId, tokenAddress);
-      const decimals = token.decimals || 18;
-      return ethers.parseUnits(Number(rawAmount).toFixed(decimals), decimals).toString();
-  } catch {
-      return ethers.parseUnits(Number(rawAmount).toFixed(18), 18).toString();
-  }
-}
-
-async function formatAmountOutput(chainId, tokenAddress, amountWei) {
-    if(!amountWei) return "0";
-    try {
-        const token = await getToken(chainId, tokenAddress);
-        const decimals = token.decimals || 18;
-        return ethers.formatUnits(amountWei, decimals).toString();
-    } catch {
-        return ethers.formatUnits(amountWei, 18).toString();
-    }
-}
-
-// ==================================================================
-// 2. LI.FI GENERATOR
+// 1. LI.FI LOGIC (Isolated)
 // ==================================================================
 async function generateLiFiQuote(params, eventId) {
     try {
@@ -64,29 +33,53 @@ async function generateLiFiQuote(params, eventId) {
         const fromToken = params.fromTokenAddress || '0x0000000000000000000000000000000000000000';
         const isNativeSell = fromToken === '0x0000000000000000000000000000000000000000';
         
-        const amount = await normalizeAmountInput(fromChain, fromToken, params.fromTokenAmount);
-        
-        console.log(`[🔍 LIFI] Generating Quote for ${amount}...`);
-        
+        // Safe amount formatting
+        let amount = '0';
+        try {
+            const token = await getToken(fromChain, fromToken);
+            amount = ethers.parseUnits(Number(params.fromTokenAmount).toFixed(token.decimals || 18), token.decimals || 18).toString();
+        } catch {
+            amount = ethers.parseUnits(Number(params.fromTokenAmount).toFixed(18), 18).toString();
+        }
+
+        console.log(`[🔍 LIFI] Fetching...`);
         const routesResponse = await getRoutes({
             fromChainId: fromChain,
             toChainId: toChain,
             fromTokenAddress: fromToken,
-            toTokenAddress: params.toTokenAddress || '0x0000000000000000000000000000000000000000',
+            toTokenAddress: params.toTokenAddress,
             fromAmount: amount,
             fromAddress: params.userAddress,
             slippage: 0.005,
             options: { integrator: INTEGRATOR, fee: FEE_PERCENT }
         });
 
-        if (!routesResponse.routes || !routesResponse.routes.length) return null;
+        if (!routesResponse.routes?.length) return null;
 
         const route = routesResponse.routes[0];
         const step = route.steps[0];
-        const transaction = await getStepTransaction(step); // Eager load
+        const transaction = await getStepTransaction(step); 
 
-        const toAmountDecimal = await formatAmountOutput(toChain, route.toToken.address, route.toAmount);
+        // Output formatting
+        let toAmountDecimal = '0';
+        try {
+            const tToken = await getToken(toChain, route.toToken.address);
+            toAmountDecimal = ethers.formatUnits(route.toAmount, tToken.decimals || 18);
+        } catch {
+            toAmountDecimal = ethers.formatUnits(route.toAmount, 18);
+        }
+
         const rate = new BigNumber(toAmountDecimal).div(params.fromTokenAmount).toFixed();
+
+        // Allowance (Honest: null if Native, Target if Token)
+        let allowanceResult = null;
+        if (!isNativeSell) {
+             allowanceResult = {
+                allowanceTarget: LIFI_ROUTER,
+                amount: params.fromTokenAmount,
+                shouldResetApprove: false
+            };
+        }
 
         return {
             info: {
@@ -95,7 +88,7 @@ async function generateLiFiQuote(params, eventId) {
                 providerLogo: 'https://uni.onekey-asset.com/static/logo/lifi.png'
             },
             fromTokenInfo: {
-                contractAddress: formatTokenAddress(route.fromToken.address, isNativeSell),
+                contractAddress: isNativeSell ? "" : fromToken.toLowerCase(),
                 networkId: params.fromNetworkId,
                 isNative: isNativeSell,
                 decimals: route.fromToken.decimals,
@@ -103,7 +96,7 @@ async function generateLiFiQuote(params, eventId) {
                 logoURI: route.fromToken.logoURI
             },
             toTokenInfo: {
-                contractAddress: formatTokenAddress(route.toToken.address, false),
+                contractAddress: route.toToken.address.toLowerCase(),
                 networkId: params.toNetworkId,
                 isNative: false,
                 decimals: route.toToken.decimals,
@@ -119,35 +112,31 @@ async function generateLiFiQuote(params, eventId) {
             fee: { percentageFee: FEE_PERCENT * 100, estimatedFeeFiatValue: 0.1 },
             routesData: [{ subRoutes: [[{ name: "Li.Fi", percent: "100", logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]] }],
             quoteResultCtx: { tx: transaction },
-            allowanceResult: null, // Force check
+            allowanceResult,
             gasLimit: transaction.gasLimit ? Number(transaction.gasLimit) : 500000,
             quoteId: uuidv4(),
-            eventId: eventId, // Synced ID
+            eventId: eventId, // IMPORTANT: Matches OneKey Stream
             isBest: true
         };
     } catch (e) {
-        console.error("LiFi Gen Error:", e.message);
+        console.error("[⚠️ LIFI FAIL]", e.message); // Likely 429
         return null;
     }
 }
 
 // ==================================================================
-// 3. MIDDLEWARE & ROUTES
+// 2. PROVIDER LIST (Inject LiFi)
 // ==================================================================
-
-// A. Inject LiFi into Provider List
 app.use('/swap/v1/providers/list', createProxyMiddleware({
     target: 'https://swap.onekeycn.com',
     changeOrigin: true,
     selfHandleResponse: true,
-    onProxyReq: (proxyReq) => {
-        // DISABLE COMPRESSION to read body
-        proxyReq.setHeader('accept-encoding', 'identity');
-    },
+    onProxyReq: (proxyReq) => proxyReq.setHeader('accept-encoding', 'identity'), // Disable compression
     onProxyRes: responseInterceptor(async (responseBuffer) => {
         try {
             const data = JSON.parse(responseBuffer.toString('utf8'));
             if (data.data) {
+                // Add LiFi to the list
                 data.data.unshift({
                     provider: 'SwapLifi',
                     name: 'Li.fi (Bitrabo)',
@@ -162,24 +151,27 @@ app.use('/swap/v1/providers/list', createProxyMiddleware({
     })
 }));
 
-// B. Inject LiFi Quote into Event Stream
+// ==================================================================
+// 3. QUOTE STREAM (Sidecar Logic)
+// ==================================================================
 app.get('/swap/v1/quote/events', async (req, res) => {
-    // Proxy query params
     const oneKeyUrl = `https://swap.onekeycn.com/swap/v1/quote/events?${new URLSearchParams(req.query).toString()}`;
     
+    // Set up SSE
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
 
     try {
+        // 1. Connect to OneKey Real Stream
         const response = await axios({
             method: 'get',
             url: oneKeyUrl,
             responseType: 'stream',
             headers: { 
                 'User-Agent': 'OneKey/1.0',
-                'Accept-Encoding': 'identity' // DISABLE COMPRESSION
+                'Accept-Encoding': 'identity' // Critical: No Gzip
             }
         });
 
@@ -189,19 +181,22 @@ app.get('/swap/v1/quote/events', async (req, res) => {
         response.data.on('data', async (chunk) => {
             const str = chunk.toString();
             
-            // 1. Pass Original Data immediately
+            // A. Pass OneKey data to user immediately (So it doesn't spin)
             res.write(chunk);
 
-            // 2. Sniff EventID
+            // B. Sniff EventID from the first OneKey packet
             if (!eventId && str.includes('"eventId":"')) {
                 const match = str.match(/"eventId":"([^"]+)"/);
-                if (match) eventId = match[1];
-                console.log(`[📡 STREAM] Captured EventID: ${eventId}`);
+                if (match) {
+                    eventId = match[1];
+                    console.log(`[📡 STREAM] Synced EventID: ${eventId}`);
+                }
             }
 
-            // 3. Inject LiFi once we have ID
+            // C. Inject LiFi (Sidecar)
             if (eventId && !lifiSent) {
                 lifiSent = true;
+                // Run in background, don't block the stream
                 generateLiFiQuote(req.query, eventId).then(lifiQuote => {
                     if (lifiQuote) {
                         console.log("[💉 INJECT] Sending Li.Fi Quote...");
@@ -215,17 +210,19 @@ app.get('/swap/v1/quote/events', async (req, res) => {
 
     } catch (e) {
         console.error("Stream Proxy Error:", e.message);
-        res.end();
+        res.end(); // Close stream if OneKey fails
     }
 });
 
-// C. Handle Build Tx (Hijack if LiFi, Proxy if others)
+// ==================================================================
+// 4. BUILD TX (Hijack if LiFi, Proxy if others)
+// ==================================================================
 app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
     const { quoteResultCtx, userAddress } = req.body;
     
-    // If it's ours (has 'tx' property from our generation)
+    // IF LI.FI: Handle locally
     if (quoteResultCtx?.tx) {
-        console.log("[⚙️ BUILD-TX] Handling Li.Fi Transaction Locally");
+        console.log("[⚙️ BUILD-TX] Handling Li.Fi Transaction");
         const tx = quoteResultCtx.tx;
         return res.json(ok({
             result: {
@@ -234,8 +231,7 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
                 protocol: 'Swap',
                 kind: 'sell',
                 fee: { percentageFee: FEE_PERCENT * 100 },
-                gasLimit: Number(tx.gasLimit || 500000),
-                routesData: [{ subRoutes: [[{ name: "Li.Fi", percent: "100", logo: "https://uni.onekey-asset.com/static/logo/lifi.png" }]] }],
+                gasLimit: Number(tx.gasLimit || 500000)
             },
             tx: {
                 to: tx.to,
@@ -246,28 +242,25 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
         }));
     }
 
-    // If not ours, forward to OneKey
-    console.log("[🔄 PROXY] Forwarding Build-Tx to OneKey");
+    // IF OTHERS: Proxy to OneKey
     try {
-        const resp = await axios.post('https://swap.onekeycn.com/swap/v1/build-tx', req.body, {
-            headers: { 'Content-Type': 'application/json' }
-        });
+        const resp = await axios.post('https://swap.onekeycn.com/swap/v1/build-tx', req.body);
         res.json(resp.data);
     } catch (e) {
         res.status(500).json({ code: -1, message: "Proxy Error" });
     }
 });
 
-// D. Fallback Proxy for all other routes (allowance, etc.)
+// ==================================================================
+// 5. CATCH-ALL PROXY
+// ==================================================================
 app.use('/swap/v1', createProxyMiddleware({
     target: 'https://swap.onekeycn.com',
     changeOrigin: true,
     logLevel: 'silent',
-    onProxyReq: (proxyReq) => {
-        proxyReq.setHeader('accept-encoding', 'identity'); // Disable compression everywhere
-    }
+    onProxyReq: (proxyReq) => proxyReq.setHeader('accept-encoding', 'identity')
 }));
 
 app.listen(PORT, () => {
-    console.log(`Bitrabo PRODUCTION Server v60 Running on ${PORT}`);
+    console.log(`Bitrabo PRODUCTION Server v61 Running on ${PORT}`);
 });
