@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { createProxyMiddleware } = require('http-proxy-middleware'); // <-- FIXED: Added this line
+const { createProxyMiddleware } = require('http-proxy-middleware');
 const BigNumber = require('bignumber.js');
 const { ethers } = require('ethers');
 const { createConfig, getRoutes, getToken, getStepTransaction } = require('@lifi/sdk');
@@ -31,7 +31,34 @@ app.use((req, res, next) => {
 });
 
 // ==================================================================
-// 1. PROVIDER LIST (THE HIJACK)
+// 1. HELPERS & LOOKUPS
+// ==================================================================
+
+// Common Token Decimals map to prevent Mock failures
+const COMMON_TOKENS = {
+    '0xdac17f958d2ee523a2206206994597c13d831ec7': { decimals: 6, symbol: 'USDT' }, // ETH USDT
+    '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48': { decimals: 6, symbol: 'USDC' }, // ETH USDC
+    '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599': { decimals: 8, symbol: 'WBTC' }, // ETH WBTC
+    '0x55d398326f99059ff775485246999027b3197955': { decimals: 18, symbol: 'USDT' }, // BSC USDT
+    '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': { decimals: 18, symbol: 'USDC' }, // BSC USDC
+};
+
+function getTokenInfo(address, isNative) {
+    if (isNative || !address || address === '') {
+        return { decimals: 18, symbol: 'ETH' }; // Default Native
+    }
+    const lower = address.toLowerCase();
+    return COMMON_TOKENS[lower] || { decimals: 18, symbol: 'TOKEN' }; // Default 18
+}
+
+function formatTokenAddress(address, isNative) {
+    if (isNative) return "";
+    if (!address || address === '0x0000000000000000000000000000000000000000') return "";
+    return address.toLowerCase();
+}
+
+// ==================================================================
+// 2. PROVIDER LIST (THE HIJACK)
 // ==================================================================
 const MY_PROVIDERS = [
     {
@@ -61,7 +88,6 @@ const MY_PROVIDERS = [
 ];
 
 app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
-    // We return ONLY our list. We do not proxy OneKey anymore.
     res.json(ok(MY_PROVIDERS));
 });
 
@@ -70,7 +96,7 @@ app.get(['/swap/v1/check-support', '/check-support'], (req, res) => {
 });
 
 // ==================================================================
-// 2. QUOTE GENERATOR (MULTI-MOCK)
+// 3. QUOTE GENERATOR (MULTI-MOCK)
 // ==================================================================
 async function generateAllQuotes(params, eventId) {
     try {
@@ -78,12 +104,17 @@ async function generateAllQuotes(params, eventId) {
         const toChain = parseInt(params.toNetworkId.replace('evm--', ''));
         const fromToken = params.fromTokenAddress || '0x0000000000000000000000000000000000000000';
         
-        let amount = params.fromTokenAmount;
+        // 1. Resolve Token Info (Crucial for Decimals)
+        let fromDecimals = 18;
         try {
             const t = await getToken(fromChain, fromToken);
-            amount = ethers.parseUnits(Number(params.fromTokenAmount).toFixed(t.decimals), t.decimals).toString();
-        } catch {}
+            fromDecimals = t.decimals;
+        } catch { 
+            fromDecimals = getTokenInfo(fromToken, !params.fromTokenAddress).decimals; 
+        }
 
+        const amount = ethers.parseUnits(Number(params.fromTokenAmount).toFixed(fromDecimals), fromDecimals).toString();
+        
         console.log(`[🔍 AGGREGATOR] Fetching main quote for ${amount}...`);
 
         let baseQuote = null;
@@ -123,26 +154,33 @@ async function generateAllQuotes(params, eventId) {
             console.warn(`[⚠️ API FAIL] ${e.message}. Switching to MOCK mode.`);
         }
 
-        // B. FALLBACK IF FAILED
+        // B. FALLBACK IF FAILED (The "Smart Mock")
         if (!baseQuote) {
             isMock = true;
-            const mockRate = 3000; // Dummy Price
+            const mockRate = 3000; // Dummy Price (ETH -> USDC approx)
+            
+            // Deduce "To" Token Decimals
+            const toInfo = getTokenInfo(params.toTokenAddress, !params.toTokenAddress);
+            const mockToAmount = (parseFloat(params.fromTokenAmount) * mockRate).toString();
+
             baseQuote = {
                 rate: mockRate.toString(),
-                toAmount: (parseFloat(params.fromTokenAmount) * mockRate).toString(),
+                toAmount: mockToAmount,
                 tx: null,
-                decimals: 18,
-                symbol: "MOCK",
+                decimals: toInfo.decimals, // Correct Decimals (e.g. 6 for USDC)
+                symbol: toInfo.symbol,
                 logoURI: ""
             };
         }
 
         // C. CLONE FOR ALL PROVIDERS
         const quotes = MY_PROVIDERS.map((p, index) => {
-            // Tweak the rate slightly for realism (Cow is 99%, OKX is 99.5%)
             const tweak = 1 - (index * 0.005); 
-            const tweakedToAmount = new BigNumber(baseQuote.toAmount).multipliedBy(tweak).toFixed(6);
-            const tweakedRate = new BigNumber(baseQuote.rate).multipliedBy(tweak).toFixed();
+            const tweakedToAmount = new BigNumber(baseQuote.toAmount).multipliedBy(tweak).toString();
+            const tweakedRate = new BigNumber(baseQuote.rate).multipliedBy(tweak).toString();
+            
+            // Calculate Min Amount (Slippage protection)
+            const minToAmount = new BigNumber(tweakedToAmount).multipliedBy(0.995).toString();
 
             return {
                 info: {
@@ -154,7 +192,7 @@ async function generateAllQuotes(params, eventId) {
                     contractAddress: params.fromTokenAddress || "",
                     networkId: params.fromNetworkId,
                     isNative: !params.fromTokenAddress,
-                    decimals: 18,
+                    decimals: fromDecimals,
                     symbol: "TOKEN"
                 },
                 toTokenInfo: {
@@ -167,23 +205,23 @@ async function generateAllQuotes(params, eventId) {
                 },
                 protocol: 'Swap',
                 kind: 'sell',
+                
                 fromAmount: params.fromTokenAmount,
                 toAmount: tweakedToAmount,
+                minToAmount: minToAmount, // Added for validity
                 instantRate: tweakedRate,
                 estimatedTime: 30 + (index * 10),
+                
                 fee: { percentageFee: FEE_PERCENT * 100, estimatedFeeFiatValue: 0.1 },
                 
-                // Route Structure
                 routesData: [{ subRoutes: [[{ name: p.name, percent: "100", logo: p.logoURI }]] }],
                 
-                // Execution Context (Always points to Base logic)
                 quoteResultCtx: { 
                     tx: baseQuote.tx, 
                     isMock: isMock,
                     providerId: p.provider 
                 },
                 
-                // Infinite Allowance Hijack (Prevents Spinning)
                 allowanceResult: {
                     allowanceTarget: LIFI_ROUTER,
                     amount: MAX_ALLOWANCE,
@@ -193,7 +231,7 @@ async function generateAllQuotes(params, eventId) {
                 gasLimit: 500000,
                 quoteId: uuidv4(),
                 eventId: eventId,
-                isBest: index === 0 // First one is best
+                isBest: index === 0 
             };
         });
 
@@ -206,7 +244,7 @@ async function generateAllQuotes(params, eventId) {
 }
 
 // ==================================================================
-// 3. QUOTE STREAM
+// 4. QUOTE STREAM
 // ==================================================================
 app.get('/swap/v1/quote/events', async (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
@@ -219,10 +257,8 @@ app.get('/swap/v1/quote/events', async (req, res) => {
     try {
         const quotes = await generateAllQuotes(req.query, eventId);
         
-        // Header
         res.write(`data: ${JSON.stringify({ totalQuoteCount: quotes.length, eventId })}\n\n`);
         
-        // Slippage Info
         res.write(`data: ${JSON.stringify({
             autoSuggestedSlippage: 0.5,
             fromNetworkId: req.query.fromNetworkId,
@@ -232,7 +268,6 @@ app.get('/swap/v1/quote/events', async (req, res) => {
             eventId: eventId
         })}\n\n`);
 
-        // Send all quotes
         for (const quote of quotes) {
             res.write(`data: ${JSON.stringify({ data: [quote] })}\n\n`);
         }
@@ -246,14 +281,14 @@ app.get('/swap/v1/quote/events', async (req, res) => {
 });
 
 // ==================================================================
-// 4. BUILD TX
+// 5. BUILD TX
 // ==================================================================
 app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
     const { quoteResultCtx, userAddress } = req.body;
 
-    // A. MOCK MODE (If LiFi is banned)
+    // A. MOCK MODE
     if (quoteResultCtx?.isMock) {
-        console.log(`[⚙️ BUILD-TX] Returning MOCK Tx for provider ${quoteResultCtx.providerId}`);
+        console.log(`[⚙️ BUILD-TX] Returning MOCK Tx for ${quoteResultCtx.providerId}`);
         return res.json(ok({
             result: {
                 info: { provider: quoteResultCtx.providerId },
@@ -273,9 +308,9 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
         }));
     }
 
-    // B. REAL MODE (If LiFi works)
+    // B. REAL MODE
     if (quoteResultCtx?.tx) {
-        console.log(`[⚙️ BUILD-TX] Returning LI.FI Tx for provider ${quoteResultCtx.providerId}`);
+        console.log(`[⚙️ BUILD-TX] Returning LI.FI Tx for ${quoteResultCtx.providerId}`);
         const tx = quoteResultCtx.tx;
         return res.json(ok({
             result: {
@@ -299,12 +334,12 @@ app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
     res.json(ok(null));
 });
 
-// 5. ALLOWANCE HIJACK (Always Approved)
+// 6. ALLOWANCE HIJACK
 app.get(['/swap/v1/allowance', '/allowance'], (req, res) => {
     res.json(ok({ allowance: MAX_ALLOWANCE })); 
 });
 
-// 6. CATCH-ALL PROXY (For everything else like token lists)
+// 7. CATCH-ALL PROXY
 app.use('/swap/v1', createProxyMiddleware({
     target: 'https://swap.onekeycn.com',
     changeOrigin: true,
@@ -312,5 +347,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-    console.log(`Bitrabo PRODUCTION Server v64 Running on ${PORT}`);
+    console.log(`Bitrabo PRODUCTION Server v65 Running on ${PORT}`);
 });
