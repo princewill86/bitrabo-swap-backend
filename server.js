@@ -6,14 +6,33 @@ const BigNumber = require('bignumber.js');
 const { ethers } = require('ethers');
 const { createConfig, getRoutes, getToken, getStepTransaction } = require('@lifi/sdk');
 const { v4: uuidv4 } = require('uuid');
-const NodeCache = require('node-cache'); // You might need to run: npm install node-cache
+
+// --- INTERNAL CACHE (No 'node-cache' dependency needed) ---
+class SimpleCache {
+    constructor(ttlSeconds) {
+        this.cache = new Map();
+        this.ttl = ttlSeconds * 1000;
+    }
+    get(key) {
+        const item = this.cache.get(key);
+        if (!item) return null;
+        if (Date.now() > item.expiry) {
+            this.cache.delete(key);
+            return null;
+        }
+        return item.value;
+    }
+    set(key, value) {
+        this.cache.set(key, {
+            value: value,
+            expiry: Date.now() + this.ttl
+        });
+    }
+}
+const quoteCache = new SimpleCache(15); // 15 Seconds TTL
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-// CACHE CONFIG (TTL = 15 seconds)
-// This prevents hitting Li.Fi limit by serving the same quote for 15s
-const quoteCache = new NodeCache({ stdTTL: 15, checkperiod: 20 });
 
 // CONFIG
 const INTEGRATOR = process.env.BITRABO_INTEGRATOR || 'bitrabo';
@@ -30,7 +49,6 @@ const jsonParser = express.json();
 const ok = (data) => ({ code: 0, message: "Success", data });
 
 app.use((req, res, next) => {
-  // Log request to see what's happening
   const isHijack = req.url.includes('quote') || req.url.includes('providers') || req.url.includes('check-support') || req.url.includes('build-tx') || req.url.includes('allowance');
   console.log(isHijack ? `[⚡ HIJACK] ${req.method} ${req.url}` : `[🔄 PROXY] ${req.method} ${req.url}`);
   next();
@@ -91,35 +109,29 @@ app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
   }]));
 });
 
-// --- NEW FIX: HANDLE ALLOWANCE CHECK ---
-// The app calls this to check if the user approved the contract.
-// We return "0" (Not Approved) so the app shows the "Approve" button correctly.
-// Returning 200 OK here stops the spinner.
+// FORCE ALLOWANCE CHECK (Return 0 -> Shows "Approve" button)
 app.get(['/swap/v1/allowance', '/allowance'], (req, res) => {
     console.log("[⚡ ALLOWANCE] Returning 0 to force approval check/button");
-    // Return 0. The app will compare 0 < amount and show "Approve".
-    // If you want to force-enable swap without approval (risky), return "115792089237316195423570985008687907853269984665640564039457584007913129639935"
     res.json(ok("0")); 
 });
 
-// REAL QUOTE LOGIC (WITH CACHING)
+// REAL QUOTE LOGIC (WITH INTERNAL CACHING)
 async function fetchLiFiQuotes(params, eventId) {
   try {
     const fromChain = parseInt(params.fromNetworkId.replace('evm--', ''));
     const toChain = parseInt(params.toNetworkId.replace('evm--', ''));
     const fromToken = params.fromTokenAddress || '0x0000000000000000000000000000000000000000';
     
-    // --- CACHE KEY ---
+    // --- CACHE CHECK ---
     const cacheKey = `${fromChain}-${toChain}-${fromToken}-${params.toTokenAddress}-${params.fromTokenAmount}`;
     const cachedQuote = quoteCache.get(cacheKey);
 
     if (cachedQuote) {
-        console.log(`[📦 CACHE HIT] Returning cached quote for ${params.fromTokenAmount}`);
-        // We must update the eventId so the cached quote matches the current stream
+        console.log(`[📦 CACHE HIT] Returning saved quote for ${params.fromTokenAmount}`);
+        // Update eventId to match current stream
         return cachedQuote.map(q => ({ ...q, eventId: eventId, quoteId: uuidv4() }));
     }
 
-    // --- NORMALIZATION ---
     const isNativeSell = fromToken === '0x0000000000000000000000000000000000000000' || 
                          fromToken.toLowerCase() === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
 
@@ -145,9 +157,7 @@ async function fetchLiFiQuotes(params, eventId) {
 
     if (!routesResponse.routes || routesResponse.routes.length === 0) return [];
 
-    // Process Routes
     const processedQuotes = await Promise.all(routesResponse.routes.map(async (route, i) => {
-      // Eager Load Transaction
       const step = route.steps[0];
       const transaction = await getStepTransaction(step); 
 
@@ -222,8 +232,6 @@ async function fetchLiFiQuotes(params, eventId) {
         }],
         
         oneKeyFeeExtraInfo: {},
-        
-        // HONEST ALLOWANCE: null force check
         allowanceResult: null, 
         
         gasLimit: transaction.gasLimit ? Number(transaction.gasLimit) : 500000,
@@ -234,7 +242,7 @@ async function fetchLiFiQuotes(params, eventId) {
       };
     }));
 
-    // --- SAVE TO CACHE ---
+    // SAVE TO CACHE
     quoteCache.set(cacheKey, processedQuotes);
     return processedQuotes;
 
@@ -279,7 +287,7 @@ app.get('/swap/v1/quote/events', async (req, res) => {
   }
 });
 
-// BUILD-TX (Uses Cached/Eager Data)
+// BUILD-TX (Uses Cached Data)
 app.post('/swap/v1/build-tx', jsonParser, async (req, res) => {
   try {
     const { quoteResultCtx, userAddress } = req.body;
@@ -341,5 +349,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`Bitrabo PRODUCTION Server v66 Running on ${PORT}`);
+  console.log(`Bitrabo PRODUCTION Server v67 Running on ${PORT}`);
 });
