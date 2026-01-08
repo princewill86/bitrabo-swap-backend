@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const { createProxyMiddleware } = require('http-proxy-middleware'); // <-- FIXED: Added this line
 const BigNumber = require('bignumber.js');
 const { ethers } = require('ethers');
 const { createConfig, getRoutes, getToken, getStepTransaction } = require('@lifi/sdk');
@@ -311,5 +312,5 @@ app.use('/swap/v1', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-    console.log(`Bitrabo PRODUCTION Server v63 Running on ${PORT}`);
+    console.log(`Bitrabo PRODUCTION Server v64 Running on ${PORT}`);
 });
