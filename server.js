@@ -83,13 +83,13 @@ function calculateFiatFee(gasLimit, gasPrice, nativePriceUSD, chainId) {
     }
 }
 
-// ⚡ STRICT FORMATTER: This fixes "No Provider Support"
+// ⚡ STRICT FORMATTER: Fixes "No Provider Support"
 function formatTokenInfo(tokenObj, networkId) {
     const isNative = (!tokenObj.address || tokenObj.address === '0x0000000000000000000000000000000000000000');
     return {
-        contractAddress: isNative ? "" : tokenObj.address, // ⚡ MUST be "" for native
+        contractAddress: isNative ? "" : tokenObj.address, // ⚡ MUST be "" for native in Quote List
         networkId: networkId,
-        isNative: isNative, // ⚡ EXPLICIT
+        isNative: isNative, 
         decimals: tokenObj.decimals || 18,
         name: tokenObj.name || "Token",
         symbol: tokenObj.symbol || "UNK",
@@ -102,22 +102,17 @@ function formatTokenInfo(tokenObj, networkId) {
 // ==================================================================
 async function verifyChangeHero() {
     if (!KEYS.CHANGEHERO) return false;
-    console.log("🕵️ Checking ChangeHero Connection...");
     try {
         await axios.get(`https://api.changehero.io/v2/exchange-amount`, {
             params: { api_key: KEYS.CHANGEHERO, from: 'btc', to: 'eth', amount: '0.1' },
             headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 5000
         });
-        console.log("   ✅ ChangeHero is ONLINE.");
         return true;
-    } catch (e) {
-        console.log(`   ⚠️ ChangeHero Check Failed: ${e.response?.status}`);
-        return false;
-    }
+    } catch (e) { return false; }
 }
 
 // ==================================================================
-// 3. CORE HANDLERS (Priority)
+// 3. CORE HANDLERS
 // ==================================================================
 
 // QUOTE ENDPOINT
@@ -135,22 +130,18 @@ app.get(['/swap/v1/quote/events', '/swap/v1/quote'], async (req, res) => {
     res.end();
 });
 
-// BUILD-TX ENDPOINT (Full Context Echo)
+// BUILD-TX ENDPOINT
 app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
     console.log("   📝 /build-tx called by Frontend");
     const { quoteResultCtx, userAddress } = req.body;
-    
-    if (!quoteResultCtx || !quoteResultCtx.tx) {
-        console.log("   ❌ /build-tx Failed: Missing quote context");
-        return res.json(ok(null));
-    }
+    if (!quoteResultCtx || !quoteResultCtx.tx) return res.json(ok(null));
 
     try {
         const isLifi = quoteResultCtx.providerId.includes('Lifi');
         const val = isLifi ? toHex(quoteResultCtx.tx.value) : new BigNumber(quoteResultCtx.tx.value).toFixed();
         const feeAmount = new BigNumber(quoteResultCtx.toAmount || 0).multipliedBy(FEE_PERCENT).toFixed(6);
 
-        // ⚡ REHYDRATE CONTEXT (Fixes Spinning)
+        // ⚡ REHYDRATE CONTEXT
         const responseData = {
             result: { 
                 info: { 
@@ -158,7 +149,6 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
                     providerName: quoteResultCtx.providerId.replace("Swap", ""),
                     providerLogo: "https://uni.onekey-asset.com/static/logo/OKXDex.png"
                 }, 
-                // ⚡ Echoing ALL data back
                 protocol: 'Swap', 
                 kind: 'sell',
                 fromTokenInfo: quoteResultCtx.fromTokenInfo, 
@@ -186,11 +176,10 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
         console.log("   ✅ /build-tx Success. Returning Full Context.");
         return res.json(ok(responseData));
 
-    } catch (e) { 
-        console.log(`   ❌ /build-tx Error: ${e.message}`);
-        return res.json(ok(null)); 
-    }
+    } catch (e) { return res.json(ok(null)); }
 });
+
+app.post('/swap/v1/quote/verify', jsonParser, (req, res) => res.json(ok({ result: true })));
 
 // ==================================================================
 // 4. PROVIDER INTEGRATIONS
@@ -348,8 +337,8 @@ async function generateAllQuotes(params, eventId) {
     let fromSymbol = "ETH";
     let toSymbol = "USDT";
     let nativePriceUSD = 0;
-
-    // ⚡ PREPARE TOKEN INFO WITH STRICT FORMATTING
+    
+    // ⚡ PREPARE TOKEN INFO (STRICT FORMATTING)
     let fromT, toT, nativeToken;
     try { 
         fromT = await getToken(fromChain, params.fromTokenAddress || '0x0000000000000000000000000000000000000000');
@@ -368,12 +357,13 @@ async function generateAllQuotes(params, eventId) {
         toT = { address: params.toTokenAddress, decimals: 18, symbol: 'UNK' };
     }
 
-    // ⚡ USE FORMATTER
     const fromTokenInfo = formatTokenInfo(fromT, params.fromNetworkId);
     const toTokenInfo = formatTokenInfo(toT, params.toNetworkId);
 
     console.log(`[🔍 AGGREGATOR] Fetching (Native Price: $${nativePriceUSD})...`);
     const isNative = fromTokenInfo.isNative;
+
+    const enrichedParams = { ...params, fromTokenInfo, toTokenInfo };
 
     const promises = PROVIDERS_CONFIG.map(async (p, i) => {
         let q = null;
@@ -391,38 +381,43 @@ async function generateAllQuotes(params, eventId) {
         console.log(`   ✅ ${p.name} Success ($${q.fiatFee})`);
         
         // ⚡ PASS ENRICHED INFO TO FORMATTER
-        return formatQuote(p, params, q, eventId, i === 0, fromTokenInfo, toTokenInfo);
+        return formatQuote(p, enrichedParams, q, eventId, i === 0);
     });
 
     const results = await Promise.all(promises);
     return results.filter(r => r !== null);
 }
 
-function formatQuote(providerConf, params, data, eventId, isBest, fromTokenInfo, toTokenInfo) {
+function formatQuote(providerConf, params, data, eventId, isBest) {
     const rate = new BigNumber(data.toAmount).div(params.fromTokenAmount).toFixed();
     return {
         info: { provider: providerConf.id, providerName: providerConf.name, providerLogo: providerConf.logo },
-        fromTokenInfo, // ⚡ STRICT
-        toTokenInfo,   // ⚡ STRICT
+        fromTokenInfo: params.fromTokenInfo, 
+        toTokenInfo: params.toTokenInfo,
         protocol: 'Swap', kind: 'sell',
         fromAmount: params.fromTokenAmount, toAmount: data.toAmount,
         instantRate: rate, estimatedTime: 30,
         fee: { percentageFee: FEE_PERCENT * 100, estimatedFeeFiatValue: data.fiatFee || 0.1, protocolFees: 0 },
         routesData: data.routesData,
-        // ⚡ PERSIST DATA
+        // ⚡ FIX: Added fields required by Frontend to validate quote
+        toAmountSlippage: 0, 
+        supportUrl: "https://help.onekey.so/hc/requests/new",
+        oneKeyFeeExtraInfo: {}, 
+        unSupportReceiveAddressDifferent: false,
+        
         quoteResultCtx: { 
             tx: data.tx, 
             providerId: providerConf.id, 
             isMock: false,
-            fromTokenInfo, 
-            toTokenInfo,   
+            fromTokenInfo: params.fromTokenInfo, 
+            toTokenInfo: params.toTokenInfo,   
             fromAmount: params.fromTokenAmount,
             toAmount: data.toAmount,
             instantRate: rate,
             routesData: data.routesData,
             ...data.ctx 
         },
-        allowanceResult: null, unSupportReceiveAddressDifferent: false,
+        allowanceResult: null, 
         gasLimit: Number(data.tx?.gasLimit || 500000),
         quoteId: uuidv4(), eventId, isBest
     };
@@ -438,7 +433,7 @@ app.use('/swap/v1', (req, res, next) => {
 app.use('/swap/v1', createProxyMiddleware({ target: 'https://swap.onekeycn.com', changeOrigin: true, logLevel: 'silent' }));
 
 app.listen(PORT, async () => {
-    console.log(`Bitrabo v110 (Hybrid Perfected) Running on ${PORT}`);
+    console.log(`Bitrabo v111 (Missing Fields Patch) Running on ${PORT}`);
     const isChangeHeroAlive = await verifyChangeHero();
     if (!isChangeHeroAlive) PROVIDERS_CONFIG = PROVIDERS_CONFIG.filter(p => p.id !== 'SwapChangeHero');
 });
