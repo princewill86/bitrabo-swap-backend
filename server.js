@@ -10,13 +10,15 @@ const axios = require('axios');
 const crypto = require('crypto');
 
 const app = express();
-const PORT = process.env.PORT || 10000; // Render usually defaults to 10000
+const PORT = process.env.PORT || 10000;
 
 // --- CONFIG ---
 const FEE_RECEIVER = process.env.BITRABO_FEE_RECEIVER; 
 const FEE_PERCENT = Number(process.env.BITRABO_FEE || 0.0025); 
 const LIFI_INTEGRATOR = process.env.BITRABO_INTEGRATOR || 'bitrabo';
-const TIMEOUT = 6000;
+
+// ⚡ UPDATED: 6000ms is too fast for Li.Fi. Increased to 15000ms.
+const TIMEOUT = 15000; 
 
 createConfig({ integrator: LIFI_INTEGRATOR, fee: FEE_PERCENT });
 
@@ -89,29 +91,25 @@ function getFakeRoutes(providerName, logo) {
 async function getZeroXQuote(params, amount, chainId, toDecimals) {
     try {
         const baseUrl = 'https://api.0x.org';
-        // v2 uses 'allowance-holder' for standard approvals
         const resp = await axios.get(`${baseUrl}/swap/allowance-holder/quote`, {
             headers: { 
                 '0x-api-key': KEYS.ZEROX,
-                '0x-version': 'v2' // <--- REQUIRED for v2
+                '0x-version': 'v2' 
             },
             params: {
-                chainId: chainId, // <--- REQUIRED in v2 params
+                chainId: chainId, 
                 sellToken: norm(params.fromTokenAddress), 
                 buyToken: norm(params.toTokenAddress),
                 sellAmount: amount, 
-                // v2 renames 'takerAddress' to 'taker'
                 taker: params.userAddress || "0x5555555555555555555555555555555555555555",
                 swapFeeRecipient: FEE_RECEIVER, 
-                swapFeeBps: 25, // 0.25% (was buyTokenPercentageFee)
+                swapFeeBps: 25, 
                 skipValidation: true 
             }, 
             timeout: TIMEOUT
         });
         
-        // v2 response structure changes: data -> transaction
         const data = resp.data;
-
         console.log(`   ✅ 0x Success`);
         return {
             toAmount: ethers.formatUnits(data.buyAmount, toDecimals), 
@@ -128,17 +126,14 @@ async function getZeroXQuote(params, amount, chainId, toDecimals) {
             fiatFee: 0.15
         };
     } catch (e) { 
-        // Log detailed error from 0x if available
         const errDetail = e.response?.data ? JSON.stringify(e.response.data) : e.message;
-        console.log(`   ❌ 0x Failed (Chain ${chainId}): ${e.response?.status} - ${errDetail}`); 
+        console.log(`   ❌ 0x Failed: ${errDetail}`); 
         return null; 
     }
 }
 
-// 1inch: Fixed Field Parsing & Fallback
 async function getOneInchQuote(params, amount, chainId, toDecimals) {
     try {
-        // Try /swap first (Rich Data)
         const resp = await axios.get(`https://api.1inch.dev/swap/v5.2/${chainId}/swap`, {
             headers: { Authorization: `Bearer ${KEYS.ONEINCH}` },
             params: {
@@ -148,13 +143,9 @@ async function getOneInchQuote(params, amount, chainId, toDecimals) {
             }, timeout: TIMEOUT
         });
 
-        // 1inch v5.2 returns 'toTokenAmount', v5.0 returned 'toAmount', v4 returned 'dstAmount'
         const dstAmount = resp.data.toTokenAmount || resp.data.dstAmount || resp.data.toAmount;
         
-        if (!dstAmount) {
-            console.log(`   ⚠️ 1inch Data Missing. Keys: ${Object.keys(resp.data)}`);
-            throw new Error("No amount field");
-        }
+        if (!dstAmount) throw new Error("No amount field");
 
         console.log("   ✅ 1inch Success");
         return {
@@ -169,6 +160,7 @@ async function getOneInchQuote(params, amount, chainId, toDecimals) {
     }
 }
 
+// ⚡ UPDATED: Better Logging for Li.Fi failures
 async function getLifiQuote(params, amount, fromChain, toChain) {
     try {
         const fromToken = (!params.fromTokenAddress) ? '0x0000000000000000000000000000000000000000' : params.fromTokenAddress;
@@ -183,8 +175,16 @@ async function getLifiQuote(params, amount, fromChain, toChain) {
             options: { integrator: LIFI_INTEGRATOR, fee: 0.0025, referrer: FEE_RECEIVER }
         });
 
-        const routes = await Promise.race([routesPromise, new Promise((_, r) => setTimeout(() => r(new Error("Timeout")), TIMEOUT))]);
-        if (!routes.routes?.length) return null;
+        // Race against the new longer timeout
+        const routes = await Promise.race([
+            routesPromise, 
+            new Promise((_, r) => setTimeout(() => r(new Error("Li.Fi Timeout")), TIMEOUT))
+        ]);
+
+        if (!routes.routes?.length) {
+            console.log("   ⚠️ Li.Fi: No routes found.");
+            return null;
+        }
         
         const route = routes.routes[0];
         const step = route.steps[0];
@@ -200,7 +200,11 @@ async function getLifiQuote(params, amount, fromChain, toChain) {
             tx, decimals: route.toToken.decimals, symbol: route.toToken.symbol,
             routesData: [], ctx: richCtx, fiatFee: parseFloat(fiatFee) + parseFloat(gasCostUSD)
         };
-    } catch (e) { return null; }
+    } catch (e) { 
+        // Now you will see WHY it fails in your logs
+        console.log(`   ❌ Li.Fi Failed: ${e.message}`);
+        return null; 
+    }
 }
 
 async function getOkxQuote(params, amount, chainId, toDecimals) {
@@ -357,4 +361,4 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
 });
 
 app.use('/swap/v1', createProxyMiddleware({ target: 'https://swap.onekeycn.com', changeOrigin: true, logLevel: 'silent' }));
-app.listen(PORT, () => console.log(`Bitrabo v94 (0x V2 Fixed) Running on ${PORT}`));
+app.listen(PORT, () => console.log(`Bitrabo v95 (Long Timeout) Running on ${PORT}`));
