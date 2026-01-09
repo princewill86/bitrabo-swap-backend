@@ -10,7 +10,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000; // Render usually defaults to 10000
 
 // --- CONFIG ---
 const FEE_RECEIVER = process.env.BITRABO_FEE_RECEIVER; 
@@ -59,21 +59,6 @@ const PROVIDERS_CONFIG = [
 // ==================================================================
 // 2. HELPERS
 // ==================================================================
-function getZeroXBaseUrl(chainId) {
-    // Force Number type for lookup
-    const id = Number(chainId);
-    const map = {
-        1: 'https://api.0x.org',
-        56: 'https://bsc.api.0x.org',
-        137: 'https://polygon.api.0x.org',
-        10: 'https://optimism.api.0x.org',
-        42161: 'https://arbitrum.api.0x.org',
-        43114: 'https://avalanche.api.0x.org',
-        8453: 'https://base.api.0x.org'
-    };
-    return map[id] || 'https://api.0x.org';
-}
-
 function toHex(val) {
     if (!val || val === '0') return "0x0";
     try {
@@ -100,31 +85,52 @@ function getFakeRoutes(providerName, logo) {
 // 3. REAL INTEGRATIONS
 // ==================================================================
 
-// 0x: Fixed URL Mapping
+// 0x (V2): FIXED - Uses new v2 endpoint, headers, and response format
 async function getZeroXQuote(params, amount, chainId, toDecimals) {
     try {
-        const baseUrl = getZeroXBaseUrl(chainId);
-        // console.log(`   --> 0x Request: ${baseUrl} (Chain ${chainId})`);
-        
-        const resp = await axios.get(`${baseUrl}/swap/v1/quote`, {
-            headers: { '0x-api-key': KEYS.ZEROX },
+        const baseUrl = 'https://api.0x.org';
+        // v2 uses 'allowance-holder' for standard approvals
+        const resp = await axios.get(`${baseUrl}/swap/allowance-holder/quote`, {
+            headers: { 
+                '0x-api-key': KEYS.ZEROX,
+                '0x-version': 'v2' // <--- REQUIRED for v2
+            },
             params: {
-                sellToken: norm(params.fromTokenAddress), buyToken: norm(params.toTokenAddress),
-                sellAmount: amount, takerAddress: params.userAddress || "0x5555555555555555555555555555555555555555",
-                feeRecipient: FEE_RECEIVER, buyTokenPercentageFee: 0.0025, skipValidation: true 
-            }, timeout: TIMEOUT
+                chainId: chainId, // <--- REQUIRED in v2 params
+                sellToken: norm(params.fromTokenAddress), 
+                buyToken: norm(params.toTokenAddress),
+                sellAmount: amount, 
+                // v2 renames 'takerAddress' to 'taker'
+                taker: params.userAddress || "0x5555555555555555555555555555555555555555",
+                swapFeeRecipient: FEE_RECEIVER, 
+                swapFeeBps: 25, // 0.25% (was buyTokenPercentageFee)
+                skipValidation: true 
+            }, 
+            timeout: TIMEOUT
         });
         
+        // v2 response structure changes: data -> transaction
+        const data = resp.data;
+
         console.log(`   ✅ 0x Success`);
         return {
-            toAmount: ethers.formatUnits(resp.data.buyAmount, toDecimals), 
-            tx: { to: resp.data.to, value: resp.data.value, data: resp.data.data, gasLimit: resp.data.gas },
-            decimals: toDecimals, symbol: "UNK", routesData: getFakeRoutes("0x", ""),
-            ctx: { zeroxChainId: chainId }, fiatFee: 0.15
+            toAmount: ethers.formatUnits(data.buyAmount, toDecimals), 
+            tx: { 
+                to: data.transaction.to, 
+                value: data.transaction.value, 
+                data: data.transaction.data, 
+                gasLimit: data.transaction.gas 
+            },
+            decimals: toDecimals, 
+            symbol: "UNK", 
+            routesData: getFakeRoutes("0x", ""),
+            ctx: { zeroxChainId: chainId }, 
+            fiatFee: 0.15
         };
     } catch (e) { 
-        const url = getZeroXBaseUrl(chainId);
-        console.log(`   ❌ 0x Failed (${url}): ${e.response?.status}`); 
+        // Log detailed error from 0x if available
+        const errDetail = e.response?.data ? JSON.stringify(e.response.data) : e.message;
+        console.log(`   ❌ 0x Failed (Chain ${chainId}): ${e.response?.status} - ${errDetail}`); 
         return null; 
     }
 }
@@ -351,4 +357,4 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
 });
 
 app.use('/swap/v1', createProxyMiddleware({ target: 'https://swap.onekeycn.com', changeOrigin: true, logLevel: 'silent' }));
-app.listen(PORT, () => console.log(`Bitrabo v93 (Router Fixed) Running on ${PORT}`));
+app.listen(PORT, () => console.log(`Bitrabo v94 (0x V2 Fixed) Running on ${PORT}`));
