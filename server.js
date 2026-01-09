@@ -30,7 +30,6 @@ const GAS_PRICE_ESTIMATES = {
     43114: "25000000000"   // Avalanche: 25 Gwei
 };
 
-// ⚡ v100: Strict Key Trimming
 const KEYS = {
     ZEROX: process.env.ZEROX_API_KEY ? process.env.ZEROX_API_KEY.trim() : undefined,
     ONEINCH: process.env.ONEINCH_API_KEY ? process.env.ONEINCH_API_KEY.trim() : undefined,
@@ -47,28 +46,7 @@ const jsonParser = express.json();
 const ok = (data) => ({ code: 0, message: "Success", data });
 
 // ==================================================================
-// 1. DATA DEFINITIONS
-// ==================================================================
-const SUPPORTED_NETWORKS = [
-    { networkId: "evm--1", network: "ETH", name: "Ethereum", symbol: "ETH", decimals: 18, indexerSupported: true },
-    { networkId: "evm--56", network: "BNB", name: "BNB Chain", symbol: "BNB", decimals: 18, indexerSupported: true },
-    { networkId: "evm--137", network: "MATIC", name: "Polygon", symbol: "MATIC", decimals: 18, indexerSupported: true },
-    { networkId: "evm--42161", network: "ETH", name: "Arbitrum", symbol: "ETH", decimals: 18, indexerSupported: true },
-    { networkId: "evm--10", network: "ETH", name: "Optimism", symbol: "ETH", decimals: 18, indexerSupported: true },
-    { networkId: "evm--8453", network: "ETH", name: "Base", symbol: "ETH", decimals: 18, indexerSupported: true },
-    { networkId: "evm--43114", network: "AVAX", name: "Avalanche", symbol: "AVAX", decimals: 18, indexerSupported: true }
-];
-
-let PROVIDERS_CONFIG = [
-    { id: 'Swap1inch', name: '1inch', logo: 'https://uni.onekey-asset.com/static/logo/1inch.png' },
-    { id: 'SwapLifi', name: 'Li.fi (Bitrabo)', logo: 'https://uni.onekey-asset.com/static/logo/lifi.png' },
-    { id: 'Swap0x', name: '0x', logo: 'https://uni.onekey-asset.com/static/logo/0xlogo.png' },
-    { id: 'SwapOKX', name: 'OKX Dex', logo: 'https://uni.onekey-asset.com/static/logo/OKXDex.png' },
-    { id: 'SwapChangeHero', name: 'ChangeHero', logo: 'https://uni.onekey-asset.com/static/logo/changeHeroFixed.png' }
-];
-
-// ==================================================================
-// 2. HELPERS
+// 1. HELPERS
 // ==================================================================
 function toHex(val) {
     if (!val || val === '0') return "0x0";
@@ -106,7 +84,7 @@ function calculateFiatFee(gasLimit, gasPrice, nativePriceUSD, chainId) {
 }
 
 // ==================================================================
-// 3. HEALTH & STARTUP
+// 2. HEALTH & STARTUP
 // ==================================================================
 async function verifyChangeHero() {
     if (!KEYS.CHANGEHERO) return false;
@@ -125,7 +103,70 @@ async function verifyChangeHero() {
 }
 
 // ==================================================================
-// 4. REAL INTEGRATIONS
+// 3. CORE HANDLERS (Top Priority)
+// ==================================================================
+
+// QUOTE ENDPOINT
+app.get(['/swap/v1/quote/events', '/swap/v1/quote'], async (req, res) => {
+    // ⚡ LOGGING: Confirm we hit local logic
+    console.log(`⚡ LOCAL QUOTE REQUEST: ${req.url.split('?')[0]}`);
+    
+    res.setHeader('Content-Type', 'text/event-stream');
+    const eventId = uuidv4();
+    try {
+        const quotes = await generateAllQuotes(req.query, eventId);
+        res.write(`data: ${JSON.stringify({ totalQuoteCount: quotes.length, eventId })}\n\n`);
+        res.write(`data: ${JSON.stringify({ autoSuggestedSlippage: 0.5, eventId, ...req.query })}\n\n`);
+        for (const q of quotes) res.write(`data: ${JSON.stringify({ data: [q] })}\n\n`);
+        res.write(`data: {"type":"done"}\n\n`);
+    } catch (e) { res.write(`data: {"type":"error"}\n\n`); }
+    res.end();
+});
+
+// BUILD-TX ENDPOINT (Fixed for Spinning Page)
+app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
+    console.log("   📝 /build-tx called by Frontend");
+    const { quoteResultCtx, userAddress } = req.body;
+    
+    if (!quoteResultCtx || !quoteResultCtx.tx) {
+        console.log("   ❌ /build-tx Failed: Missing quote context");
+        return res.json(ok(null));
+    }
+
+    try {
+        const isLifi = quoteResultCtx.providerId.includes('Lifi');
+        const val = isLifi ? toHex(quoteResultCtx.tx.value) : new BigNumber(quoteResultCtx.tx.value).toFixed();
+        const feeAmount = new BigNumber(quoteResultCtx.toAmount || 0).multipliedBy(FEE_PERCENT).toFixed(6);
+
+        // ⚡ CRITICAL FIX: The frontend spins because it's missing these details in the response
+        // We stored them in the CTX during the quote phase, now we read them back.
+        const fromTokenInfo = quoteResultCtx.fromTokenInfo || {};
+        const toTokenInfo = quoteResultCtx.toTokenInfo || {};
+        const instantRate = quoteResultCtx.instantRate || "0";
+
+        return res.json(ok({
+            result: { 
+                info: { provider: quoteResultCtx.providerId }, 
+                fromTokenInfo, // ⚡ PASS BACK
+                toTokenInfo,   // ⚡ PASS BACK
+                instantRate,   // ⚡ PASS BACK
+                protocol: 'Swap', 
+                fee: { percentageFee: FEE_PERCENT * 100 }, 
+                gasLimit: Number(quoteResultCtx.tx.gasLimit || 500000),
+                routesData: quoteResultCtx.routesData || [],
+                oneKeyFeeExtraInfo: { oneKeyFeeAmount: feeAmount, oneKeyFeeSymbol: fromTokenInfo.symbol || "TOKEN", oneKeyFeeUsd: "0.10" }
+            },
+            ctx: quoteResultCtx,
+            tx: { ...quoteResultCtx.tx, from: userAddress, value: val }
+        }));
+    } catch (e) { 
+        console.log(`   ❌ /build-tx Error: ${e.message}`);
+        return res.json(ok(null)); 
+    }
+});
+
+// ==================================================================
+// 4. PROVIDER INTEGRATIONS
 // ==================================================================
 
 async function getZeroXQuote(params, amount, chainId, toDecimals, nativePriceUSD) {
@@ -146,7 +187,7 @@ async function getZeroXQuote(params, amount, chainId, toDecimals, nativePriceUSD
             decimals: toDecimals, symbol: "UNK", routesData: getFakeRoutes("0x", ""),
             ctx: { zeroxChainId: chainId }, fiatFee
         };
-    } catch (e) { console.log(`   ❌ 0x Failed: ${e.message}`); return null; }
+    } catch (e) { return null; }
 }
 
 async function getOneInchQuote(params, amount, chainId, toDecimals, nativePriceUSD) {
@@ -169,7 +210,7 @@ async function getOneInchQuote(params, amount, chainId, toDecimals, nativePriceU
             decimals: toDecimals, symbol: "UNK", routesData: getFakeRoutes("1inch", ""),
             ctx: { oneInchChainId: 1 }, fiatFee
         };
-    } catch (e) { console.log(`   ❌ 1inch Failed: ${e.response?.status}`); return null; }
+    } catch (e) { return null; }
 }
 
 async function getOkxQuote(params, amount, chainId, toDecimals, nativePriceUSD) {
@@ -239,8 +280,25 @@ async function getLifiQuote(params, amount, fromChain, toChain) {
 }
 
 // ==================================================================
-// 5. LOCAL ENDPOINTS (These Handle Quotes 100% Locally)
+// 5. GENERATOR LOGIC
 // ==================================================================
+const SUPPORTED_NETWORKS = [
+    { networkId: "evm--1", network: "ETH", name: "Ethereum", symbol: "ETH", decimals: 18, indexerSupported: true },
+    { networkId: "evm--56", network: "BNB", name: "BNB Chain", symbol: "BNB", decimals: 18, indexerSupported: true },
+    { networkId: "evm--137", network: "MATIC", name: "Polygon", symbol: "MATIC", decimals: 18, indexerSupported: true },
+    { networkId: "evm--42161", network: "ETH", name: "Arbitrum", symbol: "ETH", decimals: 18, indexerSupported: true },
+    { networkId: "evm--10", network: "ETH", name: "Optimism", symbol: "ETH", decimals: 18, indexerSupported: true },
+    { networkId: "evm--8453", network: "ETH", name: "Base", symbol: "ETH", decimals: 18, indexerSupported: true },
+    { networkId: "evm--43114", network: "AVAX", name: "Avalanche", symbol: "AVAX", decimals: 18, indexerSupported: true }
+];
+
+let PROVIDERS_CONFIG = [
+    { id: 'Swap1inch', name: '1inch', logo: 'https://uni.onekey-asset.com/static/logo/1inch.png' },
+    { id: 'SwapLifi', name: 'Li.fi (Bitrabo)', logo: 'https://uni.onekey-asset.com/static/logo/lifi.png' },
+    { id: 'Swap0x', name: '0x', logo: 'https://uni.onekey-asset.com/static/logo/0xlogo.png' },
+    { id: 'SwapOKX', name: 'OKX Dex', logo: 'https://uni.onekey-asset.com/static/logo/OKXDex.png' },
+    { id: 'SwapChangeHero', name: 'ChangeHero', logo: 'https://uni.onekey-asset.com/static/logo/changeHeroFixed.png' }
+];
 
 app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
     const list = PROVIDERS_CONFIG.map(p => ({
@@ -253,7 +311,7 @@ app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
 });
 
 app.get(['/swap/v1/check-support', '/check-support'], (req, res) => res.json(ok([{ status: 'available', networkId: req.query.networkId }])));
-app.get(['/swap/v1/allowance', '/allowance'], (req, res) => res.json(ok("0")));
+app.get(['/swap/v1/allowance', '/allowance'], (req, res) => res.json(ok("0"))); // 0 to trigger approve if needed, or set to MAX if you want to skip
 
 async function generateAllQuotes(params, eventId) {
     const fromChain = parseInt(params.fromNetworkId.replace('evm--', ''));
@@ -264,13 +322,27 @@ async function generateAllQuotes(params, eventId) {
     let toSymbol = "USDT";
     let nativePriceUSD = 0;
 
+    // ⚡ PREPARE TOKEN INFO FOR CONTEXT 
+    // We create these objects so we can put them in the ctx later
+    const fromTokenInfo = { contractAddress: params.fromTokenAddress || "", networkId: params.fromNetworkId, decimals: 18, symbol: "ETH" };
+    const toTokenInfo = { contractAddress: params.toTokenAddress, networkId: params.toNetworkId, decimals: 18, symbol: "UNK" };
+
     try { 
         const t = await getToken(fromChain, params.fromTokenAddress || '0x0000000000000000000000000000000000000000');
         fromSymbol = t.symbol;
+        fromTokenInfo.symbol = t.symbol;
+        fromTokenInfo.decimals = t.decimals;
+        fromTokenInfo.contractAddress = t.address;
+        
         amount = ethers.parseUnits(Number(amount).toFixed(t.decimals), t.decimals).toString();
+        
         const toT = await getToken(toChain, params.toTokenAddress || '0x0000000000000000000000000000000000000000');
         toSymbol = toT.symbol;
         toDecimals = toT.decimals || 18;
+        toTokenInfo.symbol = toT.symbol;
+        toTokenInfo.decimals = toT.decimals;
+        toTokenInfo.contractAddress = toT.address;
+
         const nativeToken = await getToken(fromChain, '0x0000000000000000000000000000000000000000');
         nativePriceUSD = parseFloat(nativeToken.priceUSD || 0);
     } catch { 
@@ -294,83 +366,54 @@ async function generateAllQuotes(params, eventId) {
         }
         if (!q) return null; 
         console.log(`   ✅ ${p.name} Success ($${q.fiatFee})`);
-        return formatQuote(p, params, q, eventId, i === 0);
+        // ⚡ Pass the enriched Token Info to formatQuote
+        return formatQuote(p, params, q, eventId, i === 0, fromTokenInfo, toTokenInfo);
     });
 
     const results = await Promise.all(promises);
     return results.filter(r => r !== null);
 }
 
-function formatQuote(providerConf, params, data, eventId, isBest) {
+function formatQuote(providerConf, params, data, eventId, isBest, fromTokenInfo, toTokenInfo) {
     const rate = new BigNumber(data.toAmount).div(params.fromTokenAmount).toFixed();
     return {
         info: { provider: providerConf.id, providerName: providerConf.name, providerLogo: providerConf.logo },
-        fromTokenInfo: { contractAddress: params.fromTokenAddress || "", networkId: params.fromNetworkId, decimals: 18, symbol: "TOKEN" },
-        toTokenInfo: { contractAddress: params.toTokenAddress, networkId: params.toNetworkId, decimals: data.decimals || 18, symbol: "UNK" },
+        fromTokenInfo, // Use the enriched info
+        toTokenInfo,   // Use the enriched info
         protocol: 'Swap', kind: 'sell',
         fromAmount: params.fromTokenAmount, toAmount: data.toAmount,
         instantRate: rate, estimatedTime: 30,
         fee: { percentageFee: FEE_PERCENT * 100, estimatedFeeFiatValue: data.fiatFee || 0.1, protocolFees: 0 },
         routesData: data.routesData,
-        quoteResultCtx: { tx: data.tx, providerId: providerConf.id, isMock: false, ...data.ctx },
+        // ⚡ CRITICAL: Persist this info into the CTX so it survives the round-trip to build-tx
+        quoteResultCtx: { 
+            tx: data.tx, 
+            providerId: providerConf.id, 
+            isMock: false,
+            fromTokenInfo, // Saved!
+            toTokenInfo,   // Saved!
+            fromAmount: params.fromTokenAmount, // Saved!
+            toAmount: data.toAmount,            // Saved!
+            instantRate: rate,                  // Saved!
+            ...data.ctx 
+        },
         allowanceResult: null, unSupportReceiveAddressDifferent: false,
         gasLimit: Number(data.tx?.gasLimit || 500000),
         quoteId: uuidv4(), eventId, isBest
     };
 }
 
-app.get('/swap/v1/quote/events', async (req, res) => {
-    res.setHeader('Content-Type', 'text/event-stream');
-    const eventId = uuidv4();
-    try {
-        const quotes = await generateAllQuotes(req.query, eventId);
-        res.write(`data: ${JSON.stringify({ totalQuoteCount: quotes.length, eventId })}\n\n`);
-        res.write(`data: ${JSON.stringify({ autoSuggestedSlippage: 0.5, eventId, ...req.query })}\n\n`);
-        for (const q of quotes) res.write(`data: ${JSON.stringify({ data: [q] })}\n\n`);
-        res.write(`data: {"type":"done"}\n\n`);
-    } catch (e) { res.write(`data: {"type":"error"}\n\n`); }
-    res.end();
-});
-
-app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
-    const { quoteResultCtx, userAddress } = req.body;
-    if (!quoteResultCtx || !quoteResultCtx.tx) return res.json(ok(null));
-
-    try {
-        const isLifi = quoteResultCtx.providerId.includes('Lifi');
-        const val = isLifi ? toHex(quoteResultCtx.tx.value) : new BigNumber(quoteResultCtx.tx.value).toFixed();
-        const feeAmount = new BigNumber(quoteResultCtx.toAmount || 0).multipliedBy(FEE_PERCENT).toFixed(6);
-
-        return res.json(ok({
-            result: { 
-                info: { provider: quoteResultCtx.providerId }, 
-                protocol: 'Swap', fee: { percentageFee: FEE_PERCENT * 100 }, 
-                gasLimit: Number(quoteResultCtx.tx.gasLimit || 500000),
-                routesData: quoteResultCtx.routesData || [],
-                oneKeyFeeExtraInfo: { oneKeyFeeAmount: feeAmount, oneKeyFeeSymbol: "TOKEN", oneKeyFeeUsd: "0.10" }
-            },
-            ctx: quoteResultCtx,
-            tx: { ...quoteResultCtx.tx, from: userAddress, value: val }
-        }));
-    } catch (e) { return res.json(ok(null)); }
-});
-
 // ==================================================================
-// 6. FALLBACK PROXY (Safety Net)
+// 6. FALLBACK PROXY
 // ==================================================================
-
-// ⚡ v100: Logging Middleware to see what is being proxied
 app.use('/swap/v1', (req, res, next) => {
-    // If execution reaches here, it means NO local route matched the request.
-    // We log it so you know exactly what is "Falling through" to OneKey.
     console.log(`⚠️ Proxying to OneKey: ${req.path}`);
     next();
 });
-
 app.use('/swap/v1', createProxyMiddleware({ target: 'https://swap.onekeycn.com', changeOrigin: true, logLevel: 'silent' }));
 
 app.listen(PORT, async () => {
-    console.log(`Bitrabo v100 (Transparent Proxy) Running on ${PORT}`);
+    console.log(`Bitrabo v108 (v100 + Data Persistence) Running on ${PORT}`);
     const isChangeHeroAlive = await verifyChangeHero();
     if (!isChangeHeroAlive) PROVIDERS_CONFIG = PROVIDERS_CONFIG.filter(p => p.id !== 'SwapChangeHero');
 });
