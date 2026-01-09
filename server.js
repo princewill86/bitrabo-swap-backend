@@ -17,7 +17,7 @@ const FEE_RECEIVER = process.env.BITRABO_FEE_RECEIVER;
 const FEE_PERCENT = Number(process.env.BITRABO_FEE || 0.0025); 
 const LIFI_INTEGRATOR = process.env.BITRABO_INTEGRATOR || 'bitrabo';
 
-// ⚡ UPDATED: 6000ms is too fast for Li.Fi. Increased to 15000ms.
+// ⚡ 15s Timeout to ensure Li.Fi and ChangeHero have time to respond
 const TIMEOUT = 15000; 
 
 createConfig({ integrator: LIFI_INTEGRATOR, fee: FEE_PERCENT });
@@ -87,7 +87,7 @@ function getFakeRoutes(providerName, logo) {
 // 3. REAL INTEGRATIONS
 // ==================================================================
 
-// 0x (V2): FIXED - Uses new v2 endpoint, headers, and response format
+// 0x (V2): FIXED - Uses new v2 endpoint
 async function getZeroXQuote(params, amount, chainId, toDecimals) {
     try {
         const baseUrl = 'https://api.0x.org';
@@ -144,7 +144,6 @@ async function getOneInchQuote(params, amount, chainId, toDecimals) {
         });
 
         const dstAmount = resp.data.toTokenAmount || resp.data.dstAmount || resp.data.toAmount;
-        
         if (!dstAmount) throw new Error("No amount field");
 
         console.log("   ✅ 1inch Success");
@@ -160,7 +159,6 @@ async function getOneInchQuote(params, amount, chainId, toDecimals) {
     }
 }
 
-// ⚡ UPDATED: Better Logging for Li.Fi failures
 async function getLifiQuote(params, amount, fromChain, toChain) {
     try {
         const fromToken = (!params.fromTokenAddress) ? '0x0000000000000000000000000000000000000000' : params.fromTokenAddress;
@@ -175,7 +173,6 @@ async function getLifiQuote(params, amount, fromChain, toChain) {
             options: { integrator: LIFI_INTEGRATOR, fee: 0.0025, referrer: FEE_RECEIVER }
         });
 
-        // Race against the new longer timeout
         const routes = await Promise.race([
             routesPromise, 
             new Promise((_, r) => setTimeout(() => r(new Error("Li.Fi Timeout")), TIMEOUT))
@@ -201,7 +198,6 @@ async function getLifiQuote(params, amount, fromChain, toChain) {
             routesData: [], ctx: richCtx, fiatFee: parseFloat(fiatFee) + parseFloat(gasCostUSD)
         };
     } catch (e) { 
-        // Now you will see WHY it fails in your logs
         console.log(`   ❌ Li.Fi Failed: ${e.message}`);
         return null; 
     }
@@ -233,24 +229,40 @@ async function getOkxQuote(params, amount, chainId, toDecimals) {
     } catch (e) { return null; }
 }
 
-async function getChangeHeroQuote(params, amount, chainId) {
+// ⚡ UPDATED: Now accepts Dynamic Symbols (No more hardcoded maps)
+async function getChangeHeroQuote(params, amount, chainId, fromTicker, toTicker) {
     try {
-        const map = { '0xdac17f958d2ee523a2206206994597c13d831ec7': 'usdt', '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee': 'eth' };
-        const fromSym = map[norm(params.fromTokenAddress)];
-        const toSym = map[norm(params.toTokenAddress)];
-        if(!fromSym || !toSym) return null;
-        const readableAmount = ethers.formatUnits(amount, 18);
+        if(!fromTicker || !toTicker) {
+            console.log("   ⚠️ ChangeHero Skipped (No Symbols)");
+            return null;
+        }
+
+        const readableAmount = ethers.formatUnits(amount, 18); // ChangeHero assumes roughly 18 decimals usually
+        
+        // Pass the symbols dynamically (e.g., 'usdc', 'bnb')
         const resp = await axios.get(`https://api.changehero.io/v2/exchange-amount`, {
-            params: { api_key: KEYS.CHANGEHERO, from: fromSym, to: toSym, amount: readableAmount }, timeout: TIMEOUT
+            params: { 
+                api_key: KEYS.CHANGEHERO, 
+                from: fromTicker.toLowerCase(), 
+                to: toTicker.toLowerCase(), 
+                amount: readableAmount 
+            }, 
+            timeout: TIMEOUT
         });
+
         console.log("   ✅ ChangeHero Success");
         return {
             toAmount: String(resp.data.estimated_amount),
             tx: { to: "0xChangeHeroDepositAddr", value: amount, data: "0x", gasLimit: 21000 }, 
-            decimals: 18, symbol: toSym.toUpperCase(), routesData: [{ subRoutes: [[{ name: "ChangeHero", percent: "100", logo: "https://uni.onekey-asset.com/static/logo/changeHeroFixed.png" }]] }],
+            decimals: 18, symbol: toTicker.toUpperCase(), routesData: [{ subRoutes: [[{ name: "ChangeHero", percent: "100", logo: "https://uni.onekey-asset.com/static/logo/changeHeroFixed.png" }]] }],
             ctx: { isChangeHero: true }, fiatFee: 0.50
         };
-    } catch (e) { return null; }
+    } catch (e) { 
+        // ⚡ Log the actual error (e.g., "Min amount 50")
+        const reason = e.response?.data?.message || e.message;
+        console.log(`   ❌ ChangeHero Failed: ${reason}`);
+        return null; 
+    }
 }
 
 // ==================================================================
@@ -274,11 +286,17 @@ async function generateAllQuotes(params, eventId) {
     const toChain = parseInt(params.toNetworkId.replace('evm--', ''));
     let amount = params.fromTokenAmount;
     let toDecimals = 18;
+    let fromSymbol = "ETH";
+    let toSymbol = "USDT";
 
     try { 
+        // ⚡ Fetch Token Info to get Symbols for ChangeHero
         const t = await getToken(fromChain, params.fromTokenAddress || '0x0000000000000000000000000000000000000000');
+        fromSymbol = t.symbol;
         amount = ethers.parseUnits(Number(amount).toFixed(t.decimals), t.decimals).toString();
+        
         const toT = await getToken(toChain, params.toTokenAddress || '0x0000000000000000000000000000000000000000');
+        toSymbol = toT.symbol;
         toDecimals = toT.decimals || 18;
     } catch { 
         amount = ethers.parseUnits(Number(amount).toFixed(18), 18).toString(); 
@@ -288,15 +306,16 @@ async function generateAllQuotes(params, eventId) {
 
     const promises = PROVIDERS_CONFIG.map(async (p, i) => {
         let q = null;
+        // ⚡ Pass Symbols to ChangeHero (fromSymbol, toSymbol)
         if (fromChain !== toChain) {
             if (p.id.includes('Lifi')) q = await getLifiQuote(params, amount, fromChain, toChain);
-            else if (p.id.includes('ChangeHero')) q = await getChangeHeroQuote(params, amount, fromChain);
+            else if (p.id.includes('ChangeHero')) q = await getChangeHeroQuote(params, amount, fromChain, fromSymbol, toSymbol);
         } else {
             if (p.id.includes('Lifi')) q = await getLifiQuote(params, amount, fromChain, toChain);
             else if (p.id.includes('1inch')) q = await getOneInchQuote(params, amount, fromChain, toDecimals);
             else if (p.id.includes('0x')) q = await getZeroXQuote(params, amount, fromChain, toDecimals);
             else if (p.id.includes('OKX')) q = await getOkxQuote(params, amount, fromChain, toDecimals);
-            else if (p.id.includes('ChangeHero')) q = await getChangeHeroQuote(params, amount, fromChain);
+            else if (p.id.includes('ChangeHero')) q = await getChangeHeroQuote(params, amount, fromChain, fromSymbol, toSymbol);
         }
         if (!q) return null; 
         return formatQuote(p, params, q, eventId, i === 0);
@@ -361,4 +380,4 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
 });
 
 app.use('/swap/v1', createProxyMiddleware({ target: 'https://swap.onekeycn.com', changeOrigin: true, logLevel: 'silent' }));
-app.listen(PORT, () => console.log(`Bitrabo v95 (Long Timeout) Running on ${PORT}`));
+app.listen(PORT, () => console.log(`Bitrabo v96 (ChangeHero Fixed) Running on ${PORT}`));
