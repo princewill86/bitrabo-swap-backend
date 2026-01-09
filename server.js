@@ -43,10 +43,9 @@ const jsonParser = express.json();
 const ok = (data) => ({ code: 0, message: "Success", data });
 
 // ==================================================================
-// 1. HELPERS & 0x URL FIX
+// 1. HELPERS
 // ==================================================================
 function getZeroXBaseUrl(chainId) {
-    // 0x requires specific subdomains for most chains
     const map = {
         1: 'https://api.0x.org',
         56: 'https://bsc.api.0x.org',
@@ -60,21 +59,25 @@ function getZeroXBaseUrl(chainId) {
     return map[chainId] || 'https://api.0x.org';
 }
 
+// Convert to Hex if needed (matches Li.Fi log style)
+function toHex(val) {
+    if (!val) return "0x0";
+    if (val.toString().startsWith('0x')) return val.toString();
+    return "0x" + new BigNumber(val).toString(16);
+}
+
 // ==================================================================
-// 2. REAL INTEGRATIONS (Golden Data Logic)
+// 2. REAL INTEGRATIONS
 // ==================================================================
 
-// --- LI.FI (Matches Log: "lifiToNetworkId" ctx) ---
+// --- LI.FI ---
 async function getLifiQuote(params, amount, chainId) {
-    const fromToken = params.fromTokenAddress || '0x0000000000000000000000000000000000000000';
-    const toToken = params.toTokenAddress || '0x0000000000000000000000000000000000000000';
-    
-    // Use fallback address if user address is missing/empty to prevent validation error
     const fromAddr = (params.userAddress && params.userAddress.length > 10) ? params.userAddress : "0x5555555555555555555555555555555555555555"; 
 
     const routes = await getRoutes({
         fromChainId: chainId, toChainId: chainId,
-        fromTokenAddress: fromToken, toTokenAddress: toToken,
+        fromTokenAddress: params.fromTokenAddress || '0x0000000000000000000000000000000000000000',
+        toTokenAddress: params.toTokenAddress,
         fromAmount: amount, fromAddress: fromAddr, 
         options: { integrator: LIFI_INTEGRATOR, fee: FEE_PERCENT, referrer: FEE_RECEIVER }
     });
@@ -89,11 +92,11 @@ async function getLifiQuote(params, amount, chainId) {
         tx, 
         decimals: route.toToken.decimals, 
         symbol: route.toToken.symbol,
-        ctx: { lifiToNetworkId: params.toNetworkId } // Exact OneKey Context
+        ctx: { lifiToNetworkId: params.toNetworkId } 
     };
 }
 
-// --- 0x (Matches Log: "routesData" empty, simple fee) ---
+// --- 0x ---
 async function getZeroXQuote(params, amount, chainId) {
     const baseUrl = getZeroXBaseUrl(chainId);
     const resp = await axios.get(`${baseUrl}/swap/v1/quote`, {
@@ -108,7 +111,7 @@ async function getZeroXQuote(params, amount, chainId) {
         }
     });
     return {
-        toAmount: ethers.formatUnits(resp.data.buyAmount, 18), // 0x doesn't always return decimals, safe default
+        toAmount: ethers.formatUnits(resp.data.buyAmount, 18), 
         tx: {
             to: resp.data.to, value: resp.data.value, data: resp.data.data, gasLimit: resp.data.gas
         },
@@ -138,11 +141,9 @@ async function getOneInchQuote(params, amount, chainId) {
     };
 }
 
-// --- OKX (Matches Log: "okxToNetworkId", "routesData" with subRoutes) ---
+// --- OKX ---
 async function getOkxQuote(params, amount, chainId) {
-    // Note: OKX requires non-empty user address
     if(!params.userAddress) throw new Error("OKX requires user address");
-
     const path = `/api/v5/dex/aggregator/swap?chainId=${chainId}&amount=${amount}&fromTokenAddress=${params.fromTokenAddress}&toTokenAddress=${params.toTokenAddress}&userWalletAddress=${params.userAddress}&slippage=0.005`;
     const ts = new Date().toISOString();
     const sign = crypto.createHmac('sha256', KEYS.OKX.SECRET).update(ts + 'GET' + path).digest('base64');
@@ -156,17 +157,13 @@ async function getOkxQuote(params, amount, chainId) {
             }
         });
         if (resp.data.code !== '0') throw new Error(`OKX: ${resp.data.msg}`);
-        
         const d = resp.data.data[0];
-        
-        // Build the specific "routesData" structure OKX uses in OneKey
         const subRoutes = [[{ name: "OKX Aggregator", percent: "100", logo: "https://static.okx.com/cdn/web3/dex/logo/okx_dex.png" }]];
-
         return {
             toAmount: ethers.formatUnits(d.toTokenAmount, 18), 
             tx: { to: d.tx.to, value: d.tx.value, data: d.tx.data, gasLimit: d.tx.gas },
             decimals: 18, symbol: "UNK",
-            routesData: [{ subRoutes }], // SPECIAL FIELD FOR OKX
+            routesData: [{ subRoutes }],
             ctx: { okxToNetworkId: params.toNetworkId, okxChainId: chainId }
         };
     } catch (e) {
@@ -182,9 +179,9 @@ const MY_PROVIDERS = [
     { provider: 'Swap1inch', name: '1inch', logoURI: 'https://uni.onekey-asset.com/static/logo/1inch.png', priority: 90 },
     { provider: 'Swap0x', name: '0x', logoURI: 'https://uni.onekey-asset.com/static/logo/0xlogo.png', priority: 80 },
     { provider: 'SwapOKX', name: 'OKX Dex', logoURI: 'https://uni.onekey-asset.com/static/logo/OKXDex.png', priority: 70 },
-    { provider: 'SwapCow', name: 'Cow Swap', logoURI: 'https://uni.onekey-asset.com/static/logo/CowSwapLogo.png', priority: 60 }, // Mock
-    { provider: 'SwapChangeHero', name: 'ChangeHero', logoURI: 'https://uni.onekey-asset.com/static/logo/changeHeroFixed.png', priority: 50 }, // Mock
-    { provider: 'SwapJupiter', name: 'Jupiter', logoURI: 'https://uni.onekey-asset.com/static/logo/jupiter.png', priority: 40 } // Mock
+    { provider: 'SwapCow', name: 'Cow Swap', logoURI: 'https://uni.onekey-asset.com/static/logo/CowSwapLogo.png', priority: 60 }, 
+    { provider: 'SwapChangeHero', name: 'ChangeHero', logoURI: 'https://uni.onekey-asset.com/static/logo/changeHeroFixed.png', priority: 50 },
+    { provider: 'SwapJupiter', name: 'Jupiter', logoURI: 'https://uni.onekey-asset.com/static/logo/jupiter.png', priority: 40 }
 ];
 
 app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => res.json(ok(MY_PROVIDERS.map(p => ({ ...p, status: 'available', protocols: ['swap'] })))));
@@ -195,7 +192,6 @@ async function generateAllQuotes(params, eventId) {
     const chainId = parseInt(params.fromNetworkId.replace('evm--', ''));
     let amount = params.fromTokenAmount;
     
-    // Normalize Amount
     try { 
         const t = await getToken(chainId, params.fromTokenAddress || '0x0000000000000000000000000000000000000000');
         amount = ethers.parseUnits(Number(amount).toFixed(t.decimals), t.decimals).toString();
@@ -208,20 +204,14 @@ async function generateAllQuotes(params, eventId) {
     const promises = MY_PROVIDERS.map(async (p, i) => {
         try {
             let q = null;
-            
-            // REAL INTEGRATIONS
             if (p.name.includes('Li.fi')) q = await getLifiQuote(params, amount, chainId);
             else if (p.name.includes('1inch')) q = await getOneInchQuote(params, amount, chainId);
             else if (p.name.includes('0x')) q = await getZeroXQuote(params, amount, chainId);
             else if (p.name.includes('OKX')) q = await getOkxQuote(params, amount, chainId);
-            // CowSwap, ChangeHero, Jupiter -> Force Mock for now to ensure stability
             else throw new Error("Use Mock");
             
             return formatQuote(p, params, q, eventId, i === 0);
-
         } catch (e) {
-            // MOCK FALLBACK (Golden Data format)
-            // console.warn(`[⚠️ ${p.name}] ${e.message}. Using Fallback.`);
             return getMockQuote(p, params, eventId, i === 0);
         }
     });
@@ -229,7 +219,7 @@ async function generateAllQuotes(params, eventId) {
     return await Promise.all(promises);
 }
 
-// FORMATTER (Golden Data Structure)
+// FORMATTER (Strict Compliance)
 function formatQuote(provider, params, data, eventId, isBest) {
     const rate = new BigNumber(data.toAmount).div(params.fromTokenAmount).toFixed();
     
@@ -240,22 +230,9 @@ function formatQuote(provider, params, data, eventId, isBest) {
         protocol: 'Swap', kind: 'sell',
         fromAmount: params.fromTokenAmount, toAmount: data.toAmount,
         instantRate: rate, estimatedTime: 30,
-        
-        // FEE STRUCTURE FROM LOGS
         fee: { percentageFee: FEE_PERCENT * 100 },
-        
-        // ROUTES DATA (Use Custom if provided, else Default)
         routesData: data.routesData || [{ subRoutes: [[{ name: provider.name, percent: "100", logo: provider.logoURI }]] }],
-        
-        // PASS CONTEXT AND TX
-        quoteResultCtx: { 
-            tx: data.tx, 
-            providerId: provider.provider, 
-            isMock: false,
-            // Merge provider specific context keys
-            ...data.ctx 
-        },
-        
+        quoteResultCtx: { tx: data.tx, providerId: provider.provider, isMock: false, ...data.ctx },
         allowanceResult: null,
         gasLimit: Number(data.tx?.gasLimit || 500000),
         quoteId: uuidv4(), eventId, isBest
@@ -300,48 +277,58 @@ app.get('/swap/v1/quote/events', async (req, res) => {
 app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
     const { quoteResultCtx, userAddress } = req.body;
     
-    // Log
-    console.log(`[⚙️ BUILD-TX] Provider: ${quoteResultCtx?.providerId} | Mock: ${quoteResultCtx?.isMock}`);
+    // Safety check
+    if (!quoteResultCtx) return res.json(ok(null));
 
-    // If Mock, send dummy
-    if (quoteResultCtx?.isMock) {
+    console.log(`[⚙️ BUILD-TX] Provider: ${quoteResultCtx.providerId} | Mock: ${quoteResultCtx.isMock}`);
+
+    // MOCK RESPONSE
+    if (quoteResultCtx.isMock) {
         return res.json(ok({
             result: { 
                 info: { provider: quoteResultCtx.providerId }, 
                 protocol: 'Swap', 
                 fee: { percentageFee: 0.25 }, 
                 gasLimit: 21000,
-                routesData: [] 
+                routesData: [],
+                oneKeyFeeExtraInfo: { oneKeyFeeAmount: "0", oneKeyFeeSymbol: "ETH", oneKeyFeeUsd: "0" }
             },
             tx: { to: userAddress, value: "0", data: "0x" },
-            ctx: {} // Empty context
+            ctx: {} 
         }));
     }
 
-    // If Real, send stored TX and stored Context
-    if (quoteResultCtx?.tx) {
+    // REAL RESPONSE (Strict Formatting)
+    if (quoteResultCtx.tx) {
+        // Strict: Li.Fi wants Hex value
+        const isLifi = quoteResultCtx.providerId.includes('Lifi');
+        const val = isLifi ? toHex(quoteResultCtx.tx.value) : new BigNumber(quoteResultCtx.tx.value).toFixed();
+
         return res.json(ok({
             result: { 
                 info: { provider: quoteResultCtx.providerId }, 
                 protocol: 'Swap', 
                 fee: { percentageFee: FEE_PERCENT * 100 }, 
                 gasLimit: Number(quoteResultCtx.tx.gasLimit || 500000),
-                routesData: quoteResultCtx.routesData || []
+                routesData: quoteResultCtx.routesData || [],
+                // CRITICAL: Add this to fix spinning confirmation
+                oneKeyFeeExtraInfo: {
+                    oneKeyFeeAmount: new BigNumber(FEE_PERCENT).multipliedBy(quoteResultCtx.toAmount || 0).toFixed(6),
+                    oneKeyFeeSymbol: "TOKEN",
+                    oneKeyFeeUsd: "0.10" // Estimation to satisfy UI
+                }
             },
-            // Pass back the context we saved (lifiToNetworkId, etc)
             ctx: { 
                 lifiToNetworkId: quoteResultCtx.lifiToNetworkId,
                 okxToNetworkId: quoteResultCtx.okxToNetworkId,
                 okxChainId: quoteResultCtx.okxChainId,
                 zeroxChainId: quoteResultCtx.zeroxChainId
             },
-            tx: { ...quoteResultCtx.tx, from: userAddress, value: new BigNumber(quoteResultCtx.tx.value).toFixed() }
+            tx: { ...quoteResultCtx.tx, from: userAddress, value: val }
         }));
     }
     res.json(ok(null));
 });
 
-// PROXY (Spy disabled, normal fallback)
 app.use('/swap/v1', createProxyMiddleware({ target: 'https://swap.onekeycn.com', changeOrigin: true, logLevel: 'silent' }));
-
-app.listen(PORT, () => console.log(`Bitrabo v74 (Golden) Running on ${PORT}`));
+app.listen(PORT, () => console.log(`Bitrabo v75 (Strict) Running on ${PORT}`));
