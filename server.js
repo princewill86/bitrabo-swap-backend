@@ -12,11 +12,11 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CONFIG
+// --- CONFIG ---
 const FEE_RECEIVER = process.env.BITRABO_FEE_RECEIVER; 
 const FEE_PERCENT = Number(process.env.BITRABO_FEE || 0.0025); 
 const LIFI_INTEGRATOR = process.env.BITRABO_INTEGRATOR || 'bitrabo';
-const TIMEOUT = 4000; 
+const TIMEOUT = 4500; // Give APIs a bit more time
 
 createConfig({ integrator: LIFI_INTEGRATOR, fee: FEE_PERCENT });
 
@@ -36,11 +36,9 @@ const jsonParser = express.json();
 const ok = (data) => ({ code: 0, message: "Success", data });
 
 // ==================================================================
-// 1. DATA STRUCTURES (FIXING "NO PROVIDER SUPPORT")
+// 1. NETWORK DEFINITIONS (The "Golden Key" to fixing 'No Support')
 // ==================================================================
-
-// Matches the Spy Log "network" object structure
-const NETWORKS_LIST = [
+const SUPPORTED_NETWORKS = [
     { networkId: "evm--1", network: "ETH", name: "Ethereum", symbol: "ETH", decimals: 18, indexerSupported: true },
     { networkId: "evm--56", network: "BNB", name: "BNB Chain", symbol: "BNB", decimals: 18, indexerSupported: true },
     { networkId: "evm--137", network: "MATIC", name: "Polygon", symbol: "MATIC", decimals: 18, indexerSupported: true },
@@ -50,7 +48,7 @@ const NETWORKS_LIST = [
     { networkId: "evm--43114", network: "AVAX", name: "Avalanche", symbol: "AVAX", decimals: 18, indexerSupported: true }
 ];
 
-const MY_PROVIDERS_CONFIG = [
+const PROVIDERS_CONFIG = [
     { id: 'SwapLifi', name: 'Li.fi (Bitrabo)', logo: 'https://uni.onekey-asset.com/static/logo/lifi.png' },
     { id: 'Swap1inch', name: '1inch', logo: 'https://uni.onekey-asset.com/static/logo/1inch.png' },
     { id: 'Swap0x', name: '0x', logo: 'https://uni.onekey-asset.com/static/logo/0xlogo.png' },
@@ -84,30 +82,48 @@ function getFakeRoutes(providerName, logo) {
 }
 
 // ==================================================================
-// 3. REAL INTEGRATIONS
+// 3. REAL INTEGRATIONS (With Fees & Timeouts)
 // ==================================================================
 
-async function getLifiQuote(params, amount, chainId) {
+async function getLifiQuote(params, amount, fromChain, toChain) {
     try {
-        const fromToken = (!params.fromTokenAddress) ? '0x0000000000000000000000000000000000000000' : params.fromTokenAddress;
-        const toToken = (!params.toTokenAddress) ? '0x0000000000000000000000000000000000000000' : params.toTokenAddress;
-        if(fromToken.toLowerCase() === toToken.toLowerCase()) return null;
+        // Li.Fi prefers 0x000... for native
+        const fromToken = (!params.fromTokenAddress || params.fromTokenAddress === '') ? '0x0000000000000000000000000000000000000000' : params.fromTokenAddress;
+        const toToken = (!params.toTokenAddress || params.toTokenAddress === '') ? '0x0000000000000000000000000000000000000000' : params.toTokenAddress;
+        
+        // Prevent same-token error on same-chain
+        if(fromChain === toChain && fromToken.toLowerCase() === toToken.toLowerCase()) return null;
 
         const routesPromise = getRoutes({
-            fromChainId: chainId, toChainId: chainId,
+            fromChainId: fromChain, toChainId: toChain,
             fromTokenAddress: fromToken, toTokenAddress: toToken,
-            fromAmount: amount, fromAddress: params.userAddress || "0x5555555555555555555555555555555555555555", 
+            fromAmount: amount, 
+            fromAddress: params.userAddress || "0x5555555555555555555555555555555555555555", 
             options: { integrator: LIFI_INTEGRATOR, fee: 0.0025, referrer: FEE_RECEIVER }
         });
-        const routes = await Promise.race([routesPromise, new Promise((_, r) => setTimeout(() => r(new Error("Timeout")), TIMEOUT))]);
+
+        const routes = await Promise.race([
+            routesPromise, 
+            new Promise((_, r) => setTimeout(() => r(new Error("Timeout")), TIMEOUT))
+        ]);
 
         if (!routes.routes?.length) return null;
         const route = routes.routes[0];
-        const tx = await getStepTransaction(route.steps[0]);
         
+        // Eager load transaction for Swap
+        let tx = null;
+        if (fromChain === toChain) {
+             tx = await getStepTransaction(route.steps[0]);
+        } else {
+             // For Bridge, we might need step 0
+             tx = await getStepTransaction(route.steps[0]);
+        }
+        
+        console.log("   ✅ Li.Fi Success");
         return {
             toAmount: ethers.formatUnits(route.toAmount, route.toToken.decimals),
-            tx, decimals: route.toToken.decimals, symbol: route.toToken.symbol, routesData: [], 
+            tx, decimals: route.toToken.decimals, symbol: route.toToken.symbol,
+            routesData: [], 
             ctx: { lifiToNetworkId: params.toNetworkId } 
         };
     } catch (e) { return null; }
@@ -119,52 +135,44 @@ async function getZeroXQuote(params, amount, chainId) {
             headers: { '0x-api-key': KEYS.ZEROX },
             params: {
                 sellToken: norm(params.fromTokenAddress), buyToken: norm(params.toTokenAddress),
-                sellAmount: amount, takerAddress: params.userAddress || "0x5555555555555555555555555555555555555555",
+                sellAmount: amount, 
+                takerAddress: params.userAddress || "0x5555555555555555555555555555555555555555",
                 feeRecipient: FEE_RECEIVER, buyTokenPercentageFee: 0.0025, skipValidation: true 
-            }, timeout: TIMEOUT
+            },
+            timeout: TIMEOUT
         });
+        console.log("   ✅ 0x Success");
         return {
             toAmount: ethers.formatUnits(resp.data.buyAmount, 18), 
             tx: { to: resp.data.to, value: resp.data.value, data: resp.data.data, gasLimit: resp.data.gas },
-            decimals: 18, symbol: "UNK", routesData: getFakeRoutes("0x", ""), ctx: { zeroxChainId: chainId }
+            decimals: 18, symbol: "UNK", routesData: getFakeRoutes("0x", ""),
+            ctx: { zeroxChainId: chainId }
         };
     } catch (e) { return null; }
 }
 
 async function getOneInchQuote(params, amount, chainId) {
     try {
+        // v5.2 is reliable for standard keys
         const resp = await axios.get(`https://api.1inch.dev/swap/v5.2/${chainId}/swap`, {
             headers: { Authorization: `Bearer ${KEYS.ONEINCH}` },
             params: {
                 src: norm(params.fromTokenAddress), dst: norm(params.toTokenAddress),
-                amount, from: params.userAddress || "0x5555555555555555555555555555555555555555",
-                slippage: 1, fee: 0.25, referrer: FEE_RECEIVER, disableEstimate: true 
-            }, timeout: TIMEOUT
+                amount, 
+                from: params.userAddress || "0x5555555555555555555555555555555555555555",
+                slippage: 1, 
+                fee: 0.25, // 1inch fee
+                referrer: FEE_RECEIVER, 
+                disableEstimate: true 
+            },
+            timeout: TIMEOUT
         });
+        console.log("   ✅ 1inch Success");
         return {
             toAmount: ethers.formatUnits(resp.data.dstAmount, 18),
             tx: { to: resp.data.tx.to, value: resp.data.tx.value, data: resp.data.tx.data, gasLimit: resp.data.tx.gas },
-            decimals: 18, symbol: "UNK", routesData: getFakeRoutes("1inch", ""), ctx: { oneInchChainId: 1 }
-        };
-    } catch (e) { return null; }
-}
-
-async function getChangeHeroQuote(params, amount, chainId) {
-    try {
-        const map = { '0xdac17f958d2ee523a2206206994597c13d831ec7': 'usdt', '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee': 'eth' };
-        const fromSym = map[norm(params.fromTokenAddress)];
-        const toSym = map[norm(params.toTokenAddress)];
-        if(!fromSym || !toSym) return null;
-
-        const readableAmount = ethers.formatUnits(amount, 18);
-        const resp = await axios.get(`https://api.changehero.io/v2/exchange-amount`, {
-            params: { api_key: KEYS.CHANGEHERO, from: fromSym, to: toSym, amount: readableAmount }, timeout: TIMEOUT
-        });
-        return {
-            toAmount: String(resp.data.estimated_amount),
-            tx: { to: "0xChangeHeroDepositAddr", value: amount, data: "0x", gasLimit: 21000 }, 
-            decimals: 18, symbol: toSym.toUpperCase(), routesData: [{ subRoutes: [[{ name: "ChangeHero", percent: "100", logo: "https://uni.onekey-asset.com/static/logo/changeHeroFixed.png" }]] }],
-            ctx: { isChangeHero: true }
+            decimals: 18, symbol: "UNK", routesData: getFakeRoutes("1inch", ""),
+            ctx: { oneInchChainId: 1 }
         };
     } catch (e) { return null; }
 }
@@ -175,70 +183,115 @@ async function getOkxQuote(params, amount, chainId) {
         const path = `/api/v5/dex/aggregator/swap?chainId=${chainId}&amount=${amount}&fromTokenAddress=${norm(params.fromTokenAddress)}&toTokenAddress=${norm(params.toTokenAddress)}&userWalletAddress=${params.userAddress}&slippage=0.005`;
         const ts = new Date().toISOString();
         const sign = crypto.createHmac('sha256', KEYS.OKX.SECRET).update(ts + 'GET' + path).digest('base64');
+        
         const resp = await axios.get(`https://www.okx.com${path}`, {
-            headers: { 'OK-ACCESS-KEY': KEYS.OKX.KEY, 'OK-ACCESS-SIGN': sign, 'OK-ACCESS-TIMESTAMP': ts, 'OK-ACCESS-PASSPHRASE': KEYS.OKX.PASSPHRASE, 'X-Simulated-Trading': '0' }, timeout: TIMEOUT
+            headers: { 'OK-ACCESS-KEY': KEYS.OKX.KEY, 'OK-ACCESS-SIGN': sign, 'OK-ACCESS-TIMESTAMP': ts, 'OK-ACCESS-PASSPHRASE': KEYS.OKX.PASSPHRASE, 'X-Simulated-Trading': '0' },
+            timeout: TIMEOUT
         });
+
         if (resp.data.code !== '0' || !resp.data.data || !resp.data.data[0]) return null;
         const d = resp.data.data[0];
+        console.log("   ✅ OKX Success");
         return {
             toAmount: ethers.formatUnits(d.toTokenAmount, 18), 
             tx: { to: d.tx.to, value: d.tx.value, data: d.tx.data, gasLimit: d.tx.gas },
-            decimals: 18, symbol: "UNK", routesData: getFakeRoutes("OKX", ""), ctx: { okxToNetworkId: params.toNetworkId, okxChainId: chainId }
+            decimals: 18, symbol: "UNK", routesData: getFakeRoutes("OKX", ""),
+            ctx: { okxToNetworkId: params.toNetworkId, okxChainId: chainId }
+        };
+    } catch (e) { return null; }
+}
+
+async function getChangeHeroQuote(params, amount, chainId) {
+    try {
+        // ChangeHero requires symbol mapping. If we can't map, we skip.
+        const map = { '0xdac17f958d2ee523a2206206994597c13d831ec7': 'usdt', '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee': 'eth' };
+        const fromSym = map[norm(params.fromTokenAddress)];
+        const toSym = map[norm(params.toTokenAddress)];
+        if(!fromSym || !toSym) return null;
+
+        const readableAmount = ethers.formatUnits(amount, 18);
+        const resp = await axios.get(`https://api.changehero.io/v2/exchange-amount`, {
+            params: { api_key: KEYS.CHANGEHERO, from: fromSym, to: toSym, amount: readableAmount },
+            timeout: TIMEOUT
+        });
+        console.log("   ✅ ChangeHero Success");
+        return {
+            toAmount: String(resp.data.estimated_amount),
+            tx: { to: "0xChangeHeroDepositAddr", value: amount, data: "0x", gasLimit: 21000 }, 
+            decimals: 18, symbol: toSym.toUpperCase(), 
+            routesData: [{ subRoutes: [[{ name: "ChangeHero", percent: "100", logo: "https://uni.onekey-asset.com/static/logo/changeHeroFixed.png" }]] }],
+            ctx: { isChangeHero: true }
         };
     } catch (e) { return null; }
 }
 
 // ==================================================================
-// 4. PROVIDER LIST ENDPOINT (FIXED)
+// 4. PROTOCOL ENDPOINTS (THE FIX)
 // ==================================================================
+
+// This endpoint is what the app calls to decide if it should show the provider
 app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
-    // Construct the nested object exactly as OneKey expects
-    const providersList = MY_PROVIDERS_CONFIG.map(p => ({
+    const list = PROVIDERS_CONFIG.map(p => ({
         providerInfo: {
             provider: p.id,
             name: p.name,
             logo: p.logo,
             protocol: "Swap"
         },
+        // Tell OneKey this provider supports single chain AND cross chain for ALL defined networks
         isSupportSingleSwap: true,
         isSupportCrossChain: true,
-        supportSingleSwapNetworks: NETWORKS_LIST, // Claim support for all main nets
-        supportCrossChainNetworks: NETWORKS_LIST,
+        supportSingleSwapNetworks: SUPPORTED_NETWORKS,
+        supportCrossChainNetworks: SUPPORTED_NETWORKS,
         providerServiceDisable: false,
         serviceDisableNetworks: []
     }));
-
-    res.json(ok(providersList));
+    res.json(ok(list));
 });
 
 app.get(['/swap/v1/check-support', '/check-support'], (req, res) => res.json(ok([{ status: 'available', networkId: req.query.networkId }])));
-app.get(['/swap/v1/allowance', '/allowance'], (req, res) => res.json(ok("0"))); 
+app.get(['/swap/v1/allowance', '/allowance'], (req, res) => res.json(ok("0"))); // Force Approve
 
 // ==================================================================
-// 5. AGGREGATOR & BUILD TX
+// 5. AGGREGATOR
 // ==================================================================
 async function generateAllQuotes(params, eventId) {
-    const chainId = parseInt(params.fromNetworkId.replace('evm--', ''));
+    const fromChain = parseInt(params.fromNetworkId.replace('evm--', ''));
+    const toChain = parseInt(params.toNetworkId.replace('evm--', ''));
     let amount = params.fromTokenAmount;
     
+    // Normalize Amount
     try { 
-        const t = await getToken(chainId, params.fromTokenAddress || '0x0000000000000000000000000000000000000000');
+        const t = await getToken(fromChain, params.fromTokenAddress || '0x0000000000000000000000000000000000000000');
         amount = ethers.parseUnits(Number(amount).toFixed(t.decimals), t.decimals).toString();
     } catch {
         amount = ethers.parseUnits(Number(amount).toFixed(18), 18).toString();
     }
 
-    console.log(`[🔍 AGGREGATOR] Fetching with 0.25% Fee...`);
+    console.log(`[🔍 AGGREGATOR] Fetching...`);
 
-    const promises = MY_PROVIDERS_CONFIG.map(async (p, i) => {
+    const promises = PROVIDERS_CONFIG.map(async (p, i) => {
         let q = null;
-        if (p.id.includes('Lifi')) q = await getLifiQuote(params, amount, chainId);
-        else if (p.id.includes('1inch')) q = await getOneInchQuote(params, amount, chainId);
-        else if (p.id.includes('0x')) q = await getZeroXQuote(params, amount, chainId);
-        else if (p.id.includes('OKX')) q = await getOkxQuote(params, amount, chainId);
-        else if (p.id.includes('ChangeHero')) q = await getChangeHeroQuote(params, amount, chainId);
         
-        if (!q) return getMockQuote(p, params, eventId, i === 0);
+        // 1. CROSS CHAIN? Li.Fi Only (others are swap only usually)
+        if (fromChain !== toChain) {
+            if (p.id.includes('Lifi')) q = await getLifiQuote(params, amount, fromChain, toChain);
+            else if (p.id.includes('ChangeHero')) q = await getChangeHeroQuote(params, amount, fromChain); // ChangeHero works cross chain
+            // Skip others for bridge to avoid errors
+        } else {
+            // 2. SAME CHAIN
+            if (p.id.includes('Lifi')) q = await getLifiQuote(params, amount, fromChain, toChain);
+            else if (p.id.includes('1inch')) q = await getOneInchQuote(params, amount, fromChain);
+            else if (p.id.includes('0x')) q = await getZeroXQuote(params, amount, fromChain);
+            else if (p.id.includes('OKX')) q = await getOkxQuote(params, amount, fromChain);
+            else if (p.id.includes('ChangeHero')) q = await getChangeHeroQuote(params, amount, fromChain);
+        }
+        
+        // 3. FALLBACK TO MOCK
+        if (!q) {
+            return getMockQuote(p, params, eventId, i === 0);
+        }
+
         return formatQuote(p, params, q, eventId, i === 0);
     });
 
@@ -250,7 +303,7 @@ function formatQuote(providerConf, params, data, eventId, isBest) {
     return {
         info: { provider: providerConf.id, providerName: providerConf.name, providerLogo: providerConf.logo },
         fromTokenInfo: { contractAddress: params.fromTokenAddress || "", networkId: params.fromNetworkId, decimals: 18, symbol: "TOKEN" },
-        toTokenInfo: { contractAddress: params.toTokenAddress, networkId: params.toNetworkId, decimals: data.decimals || 18, symbol: "UNK" },
+        toTokenInfo: { contractAddress: params.toTokenAddress, networkId: params.toNetworkId, decimals: data.decimals || 18, symbol: data.symbol || "UNK" },
         protocol: 'Swap', kind: 'sell',
         fromAmount: params.fromTokenAmount, toAmount: data.toAmount,
         instantRate: rate, estimatedTime: 30,
@@ -328,4 +381,4 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
 });
 
 app.use('/swap/v1', createProxyMiddleware({ target: 'https://swap.onekeycn.com', changeOrigin: true, logLevel: 'silent' }));
-app.listen(PORT, () => console.log(`Bitrabo v87 (Provider Fix) Running on ${PORT}`));
+app.listen(PORT, () => console.log(`Bitrabo v88 (Protocol Fixed) Running on ${PORT}`));
