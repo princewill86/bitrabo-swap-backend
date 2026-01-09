@@ -103,14 +103,12 @@ async function verifyChangeHero() {
 }
 
 // ==================================================================
-// 3. CORE HANDLERS (Top Priority)
+// 3. CORE HANDLERS (Priority)
 // ==================================================================
 
 // QUOTE ENDPOINT
 app.get(['/swap/v1/quote/events', '/swap/v1/quote'], async (req, res) => {
-    // ⚡ LOGGING: Confirm we hit local logic
     console.log(`⚡ LOCAL QUOTE REQUEST: ${req.url.split('?')[0]}`);
-    
     res.setHeader('Content-Type', 'text/event-stream');
     const eventId = uuidv4();
     try {
@@ -123,7 +121,7 @@ app.get(['/swap/v1/quote/events', '/swap/v1/quote'], async (req, res) => {
     res.end();
 });
 
-// BUILD-TX ENDPOINT (Fixed for Spinning Page)
+// ⚡ v109: BUILD-TX (The Fix)
 app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
     console.log("   📝 /build-tx called by Frontend");
     const { quoteResultCtx, userAddress } = req.body;
@@ -138,27 +136,44 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
         const val = isLifi ? toHex(quoteResultCtx.tx.value) : new BigNumber(quoteResultCtx.tx.value).toFixed();
         const feeAmount = new BigNumber(quoteResultCtx.toAmount || 0).multipliedBy(FEE_PERCENT).toFixed(6);
 
-        // ⚡ CRITICAL FIX: The frontend spins because it's missing these details in the response
-        // We stored them in the CTX during the quote phase, now we read them back.
-        const fromTokenInfo = quoteResultCtx.fromTokenInfo || {};
-        const toTokenInfo = quoteResultCtx.toTokenInfo || {};
-        const instantRate = quoteResultCtx.instantRate || "0";
-
-        return res.json(ok({
+        // ⚡ REHYDRATE CONTEXT: 
+        // We unpack the data we saved during the quote phase.
+        // If the frontend needs 'fromAmount' to verify, we give it back exactly as it was.
+        const responseData = {
             result: { 
-                info: { provider: quoteResultCtx.providerId }, 
-                fromTokenInfo, // ⚡ PASS BACK
-                toTokenInfo,   // ⚡ PASS BACK
-                instantRate,   // ⚡ PASS BACK
+                info: { 
+                    provider: quoteResultCtx.providerId,
+                    providerName: quoteResultCtx.providerId.replace("Swap", ""),
+                    providerLogo: "https://uni.onekey-asset.com/static/logo/OKXDex.png"
+                }, 
+                // ⚡ KEY FIX: Echo back ALL quote parameters
                 protocol: 'Swap', 
-                fee: { percentageFee: FEE_PERCENT * 100 }, 
-                gasLimit: Number(quoteResultCtx.tx.gasLimit || 500000),
+                kind: 'sell',
+                fromTokenInfo: quoteResultCtx.fromTokenInfo, // Saved in v109 formatQuote
+                toTokenInfo: quoteResultCtx.toTokenInfo,     // Saved in v109 formatQuote
+                fromAmount: quoteResultCtx.fromAmount,
+                toAmount: quoteResultCtx.toAmount,
+                instantRate: quoteResultCtx.instantRate,
+                estimatedTime: 30,
+                fee: { percentageFee: FEE_PERCENT * 100, estimatedFeeFiatValue: 0.1 }, 
                 routesData: quoteResultCtx.routesData || [],
-                oneKeyFeeExtraInfo: { oneKeyFeeAmount: feeAmount, oneKeyFeeSymbol: fromTokenInfo.symbol || "TOKEN", oneKeyFeeUsd: "0.10" }
+                supportUrl: "https://help.onekey.so/hc/requests/new",
+                unSupportReceiveAddressDifferent: false,
+                oneKeyFeeExtraInfo: { 
+                    oneKeyFeeAmount: feeAmount, 
+                    oneKeyFeeSymbol: quoteResultCtx.fromTokenInfo?.symbol || "TOKEN", 
+                    oneKeyFeeUsd: "0.10" 
+                },
+                gasLimit: Number(quoteResultCtx.tx.gasLimit || 500000),
+                slippage: 0.5
             },
             ctx: quoteResultCtx,
             tx: { ...quoteResultCtx.tx, from: userAddress, value: val }
-        }));
+        };
+
+        console.log("   ✅ /build-tx Success. Returning Full Context.");
+        return res.json(ok(responseData));
+
     } catch (e) { 
         console.log(`   ❌ /build-tx Error: ${e.message}`);
         return res.json(ok(null)); 
@@ -311,7 +326,7 @@ app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
 });
 
 app.get(['/swap/v1/check-support', '/check-support'], (req, res) => res.json(ok([{ status: 'available', networkId: req.query.networkId }])));
-app.get(['/swap/v1/allowance', '/allowance'], (req, res) => res.json(ok("0"))); // 0 to trigger approve if needed, or set to MAX if you want to skip
+app.get(['/swap/v1/allowance', '/allowance'], (req, res) => res.json(ok("99999999999999999999999999999999")));
 
 async function generateAllQuotes(params, eventId) {
     const fromChain = parseInt(params.fromNetworkId.replace('evm--', ''));
@@ -322,8 +337,7 @@ async function generateAllQuotes(params, eventId) {
     let toSymbol = "USDT";
     let nativePriceUSD = 0;
 
-    // ⚡ PREPARE TOKEN INFO FOR CONTEXT 
-    // We create these objects so we can put them in the ctx later
+    // ⚡ PREPARE TOKEN INFO FOR CONTEXT
     const fromTokenInfo = { contractAddress: params.fromTokenAddress || "", networkId: params.fromNetworkId, decimals: 18, symbol: "ETH" };
     const toTokenInfo = { contractAddress: params.toTokenAddress, networkId: params.toNetworkId, decimals: 18, symbol: "UNK" };
 
@@ -366,7 +380,7 @@ async function generateAllQuotes(params, eventId) {
         }
         if (!q) return null; 
         console.log(`   ✅ ${p.name} Success ($${q.fiatFee})`);
-        // ⚡ Pass the enriched Token Info to formatQuote
+        // ⚡ Pass the enriched Token Info
         return formatQuote(p, params, q, eventId, i === 0, fromTokenInfo, toTokenInfo);
     });
 
@@ -378,23 +392,24 @@ function formatQuote(providerConf, params, data, eventId, isBest, fromTokenInfo,
     const rate = new BigNumber(data.toAmount).div(params.fromTokenAmount).toFixed();
     return {
         info: { provider: providerConf.id, providerName: providerConf.name, providerLogo: providerConf.logo },
-        fromTokenInfo, // Use the enriched info
-        toTokenInfo,   // Use the enriched info
+        fromTokenInfo, 
+        toTokenInfo,
         protocol: 'Swap', kind: 'sell',
         fromAmount: params.fromTokenAmount, toAmount: data.toAmount,
         instantRate: rate, estimatedTime: 30,
         fee: { percentageFee: FEE_PERCENT * 100, estimatedFeeFiatValue: data.fiatFee || 0.1, protocolFees: 0 },
         routesData: data.routesData,
-        // ⚡ CRITICAL: Persist this info into the CTX so it survives the round-trip to build-tx
+        // ⚡ PERSIST: Save everything needed for build-tx later
         quoteResultCtx: { 
             tx: data.tx, 
             providerId: providerConf.id, 
             isMock: false,
-            fromTokenInfo, // Saved!
-            toTokenInfo,   // Saved!
-            fromAmount: params.fromTokenAmount, // Saved!
-            toAmount: data.toAmount,            // Saved!
-            instantRate: rate,                  // Saved!
+            fromTokenInfo,
+            toTokenInfo,
+            fromAmount: params.fromTokenAmount,
+            toAmount: data.toAmount,
+            instantRate: rate,
+            routesData: data.routesData, // Saved!
             ...data.ctx 
         },
         allowanceResult: null, unSupportReceiveAddressDifferent: false,
@@ -413,7 +428,7 @@ app.use('/swap/v1', (req, res, next) => {
 app.use('/swap/v1', createProxyMiddleware({ target: 'https://swap.onekeycn.com', changeOrigin: true, logLevel: 'silent' }));
 
 app.listen(PORT, async () => {
-    console.log(`Bitrabo v108 (v100 + Data Persistence) Running on ${PORT}`);
+    console.log(`Bitrabo v109 (Full Context Echo) Running on ${PORT}`);
     const isChangeHeroAlive = await verifyChangeHero();
     if (!isChangeHeroAlive) PROVIDERS_CONFIG = PROVIDERS_CONFIG.filter(p => p.id !== 'SwapChangeHero');
 });
