@@ -16,7 +16,7 @@ const PORT = process.env.PORT || 3000;
 const FEE_RECEIVER = process.env.BITRABO_FEE_RECEIVER; 
 const FEE_PERCENT = Number(process.env.BITRABO_FEE || 0.0025); 
 const LIFI_INTEGRATOR = process.env.BITRABO_INTEGRATOR || 'bitrabo';
-const TIMEOUT = 6000; // 6s Timeout (Give them time)
+const TIMEOUT = 6000;
 
 createConfig({ integrator: LIFI_INTEGRATOR, fee: FEE_PERCENT });
 
@@ -36,30 +36,21 @@ const jsonParser = express.json();
 const ok = (data) => ({ code: 0, message: "Success", data });
 
 // ==================================================================
-// 1. DATA DEFINITIONS
+// 1. HELPERS
 // ==================================================================
-const SUPPORTED_NETWORKS = [
-    { networkId: "evm--1", network: "ETH", name: "Ethereum", symbol: "ETH", decimals: 18, indexerSupported: true },
-    { networkId: "evm--56", network: "BNB", name: "BNB Chain", symbol: "BNB", decimals: 18, indexerSupported: true },
-    { networkId: "evm--137", network: "MATIC", name: "Polygon", symbol: "MATIC", decimals: 18, indexerSupported: true },
-    { networkId: "evm--42161", network: "ETH", name: "Arbitrum", symbol: "ETH", decimals: 18, indexerSupported: true },
-    { networkId: "evm--10", network: "ETH", name: "Optimism", symbol: "ETH", decimals: 18, indexerSupported: true },
-    { networkId: "evm--8453", network: "ETH", name: "Base", symbol: "ETH", decimals: 18, indexerSupported: true },
-    { networkId: "evm--43114", network: "AVAX", name: "Avalanche", symbol: "AVAX", decimals: 18, indexerSupported: true }
-];
+function getZeroXBaseUrl(chainId) {
+    const map = {
+        1: 'https://api.0x.org',
+        56: 'https://bsc.api.0x.org',
+        137: 'https://polygon.api.0x.org',
+        10: 'https://optimism.api.0x.org',
+        42161: 'https://arbitrum.api.0x.org',
+        43114: 'https://avalanche.api.0x.org',
+        8453: 'https://base.api.0x.org'
+    };
+    return map[chainId] || 'https://api.0x.org';
+}
 
-// REORDERED: 1inch First, Li.Fi Second
-const PROVIDERS_CONFIG = [
-    { id: 'Swap1inch', name: '1inch', logo: 'https://uni.onekey-asset.com/static/logo/1inch.png' },
-    { id: 'SwapLifi', name: 'Li.fi (Bitrabo)', logo: 'https://uni.onekey-asset.com/static/logo/lifi.png' },
-    { id: 'Swap0x', name: '0x', logo: 'https://uni.onekey-asset.com/static/logo/0xlogo.png' },
-    { id: 'SwapOKX', name: 'OKX Dex', logo: 'https://uni.onekey-asset.com/static/logo/OKXDex.png' },
-    { id: 'SwapChangeHero', name: 'ChangeHero', logo: 'https://uni.onekey-asset.com/static/logo/changeHeroFixed.png' }
-];
-
-// ==================================================================
-// 2. HELPERS
-// ==================================================================
 function toHex(val) {
     if (!val || val === '0') return "0x0";
     try {
@@ -82,8 +73,26 @@ function getFakeRoutes(providerName, logo) {
     return [{ subRoutes: [[{ name: providerName, percent: "100", logo: logo }]] }];
 }
 
+const SUPPORTED_NETWORKS = [
+    { networkId: "evm--1", network: "ETH", name: "Ethereum", symbol: "ETH", decimals: 18, indexerSupported: true },
+    { networkId: "evm--56", network: "BNB", name: "BNB Chain", symbol: "BNB", decimals: 18, indexerSupported: true },
+    { networkId: "evm--137", network: "MATIC", name: "Polygon", symbol: "MATIC", decimals: 18, indexerSupported: true },
+    { networkId: "evm--42161", network: "ETH", name: "Arbitrum", symbol: "ETH", decimals: 18, indexerSupported: true },
+    { networkId: "evm--10", network: "ETH", name: "Optimism", symbol: "ETH", decimals: 18, indexerSupported: true },
+    { networkId: "evm--8453", network: "ETH", name: "Base", symbol: "ETH", decimals: 18, indexerSupported: true },
+    { networkId: "evm--43114", network: "AVAX", name: "Avalanche", symbol: "AVAX", decimals: 18, indexerSupported: true }
+];
+
+const PROVIDERS_CONFIG = [
+    { id: 'Swap1inch', name: '1inch', logo: 'https://uni.onekey-asset.com/static/logo/1inch.png' },
+    { id: 'SwapLifi', name: 'Li.fi (Bitrabo)', logo: 'https://uni.onekey-asset.com/static/logo/lifi.png' },
+    { id: 'Swap0x', name: '0x', logo: 'https://uni.onekey-asset.com/static/logo/0xlogo.png' },
+    { id: 'SwapOKX', name: 'OKX Dex', logo: 'https://uni.onekey-asset.com/static/logo/OKXDex.png' },
+    { id: 'SwapChangeHero', name: 'ChangeHero', logo: 'https://uni.onekey-asset.com/static/logo/changeHeroFixed.png' }
+];
+
 // ==================================================================
-// 3. REAL INTEGRATIONS (HONEST MODE - NO MOCKS)
+// 3. REAL INTEGRATIONS (CORRECTED PARSING)
 // ==================================================================
 
 async function getLifiQuote(params, amount, fromChain, toChain) {
@@ -107,10 +116,7 @@ async function getLifiQuote(params, amount, fromChain, toChain) {
         const step = route.steps[0];
         const tx = await getStepTransaction(step);
 
-        const richCtx = {
-            lifiQuoteResultCtx: { stepInfo: step, estimate: step.estimate, includedSteps: route.steps },
-            lifiToNetworkId: params.toNetworkId
-        };
+        const richCtx = { lifiQuoteResultCtx: { stepInfo: step, estimate: step.estimate, includedSteps: route.steps }, lifiToNetworkId: params.toNetworkId };
         const fiatFee = step.estimate?.feeCosts?.[0]?.amountUSD || 0.1;
         const gasCostUSD = step.estimate?.gasCosts?.[0]?.amountUSD || 0.1;
 
@@ -120,25 +126,22 @@ async function getLifiQuote(params, amount, fromChain, toChain) {
             tx, decimals: route.toToken.decimals, symbol: route.toToken.symbol,
             routesData: [], ctx: richCtx, fiatFee: parseFloat(fiatFee) + parseFloat(gasCostUSD)
         };
-    } catch (e) { 
-        console.log(`   ❌ Li.Fi Failed: ${e.message}`);
-        return null; 
-    }
+    } catch (e) { return null; }
 }
 
 async function getZeroXQuote(params, amount, chainId) {
     try {
-        const resp = await axios.get(`https://api.0x.org/swap/v1/quote`, {
+        const baseUrl = getZeroXBaseUrl(chainId); // USE DYNAMIC URL
+        const resp = await axios.get(`${baseUrl}/swap/v1/quote`, {
             headers: { '0x-api-key': KEYS.ZEROX },
             params: {
                 sellToken: norm(params.fromTokenAddress), buyToken: norm(params.toTokenAddress),
                 sellAmount: amount, takerAddress: params.userAddress || "0x5555555555555555555555555555555555555555",
-                feeRecipient: FEE_RECEIVER, 
-                buyTokenPercentageFee: 0.0025, // 0x expects decimal (0.0025 = 0.25%)
-                skipValidation: true 
+                feeRecipient: FEE_RECEIVER, buyTokenPercentageFee: 0.0025, skipValidation: true 
             }, timeout: TIMEOUT
         });
-        console.log("   ✅ 0x Success");
+        
+        console.log(`   ✅ 0x Success`);
         return {
             toAmount: ethers.formatUnits(resp.data.buyAmount, 18), 
             tx: { to: resp.data.to, value: resp.data.value, data: resp.data.data, gasLimit: resp.data.gas },
@@ -146,7 +149,7 @@ async function getZeroXQuote(params, amount, chainId) {
             ctx: { zeroxChainId: chainId }, fiatFee: 0.15
         };
     } catch (e) { 
-        console.log(`   ❌ 0x Failed: ${e.response?.status} ${e.response?.data?.reason || e.message}`);
+        console.log(`   ❌ 0x Failed: ${e.response?.status}`); // Log only status
         return null; 
     }
 }
@@ -158,21 +161,23 @@ async function getOneInchQuote(params, amount, chainId) {
             params: {
                 src: norm(params.fromTokenAddress), dst: norm(params.toTokenAddress),
                 amount, from: params.userAddress || "0x5555555555555555555555555555555555555555",
-                slippage: 1, 
-                fee: 0.25, // 1inch v5 expects number (0.25 might mean 0.25%)
-                referrer: FEE_RECEIVER, 
-                disableEstimate: true 
+                slippage: 1, fee: 0.25, referrer: FEE_RECEIVER, disableEstimate: true 
             }, timeout: TIMEOUT
         });
+
+        // SAFE PARSING: Check multiple possible fields
+        const dstAmount = resp.data.dstAmount || resp.data.toTokenAmount || resp.data.toAmount;
+        if (!dstAmount) throw new Error("1inch: No amount in response");
+
         console.log("   ✅ 1inch Success");
         return {
-            toAmount: ethers.formatUnits(resp.data.dstAmount, 18),
+            toAmount: ethers.formatUnits(dstAmount, 18),
             tx: { to: resp.data.tx.to, value: resp.data.tx.value, data: resp.data.tx.data, gasLimit: resp.data.tx.gas },
             decimals: 18, symbol: "UNK", routesData: getFakeRoutes("1inch", ""),
             ctx: { oneInchChainId: 1 }, fiatFee: 0.20
         };
     } catch (e) { 
-        console.log(`   ❌ 1inch Failed: ${e.response?.status} ${JSON.stringify(e.response?.data)}`);
+        console.log(`   ❌ 1inch Failed: ${e.message}`);
         return null; 
     }
 }
@@ -186,14 +191,18 @@ async function getOkxQuote(params, amount, chainId) {
         const resp = await axios.get(`https://www.okx.com${path}`, {
             headers: { 'OK-ACCESS-KEY': KEYS.OKX.KEY, 'OK-ACCESS-SIGN': sign, 'OK-ACCESS-TIMESTAMP': ts, 'OK-ACCESS-PASSPHRASE': KEYS.OKX.PASSPHRASE, 'X-Simulated-Trading': '0' }, timeout: TIMEOUT
         });
-        if (resp.data.code !== '0' || !resp.data.data || !resp.data.data[0]) {
-             console.log(`   ❌ OKX Logic Fail: ${resp.data.msg}`);
-             return null;
-        }
+
+        if (resp.data.code !== '0' || !resp.data.data || !resp.data.data[0]) return null;
+        
+        // SAFE PARSING: Handle nested structure
         const d = resp.data.data[0];
+        const outAmount = d.toTokenAmount || d.routerResult?.toTokenAmount;
+        
+        if (!outAmount) throw new Error("OKX: No amount found");
+
         console.log("   ✅ OKX Success");
         return {
-            toAmount: ethers.formatUnits(d.toTokenAmount, 18), 
+            toAmount: ethers.formatUnits(outAmount, 18), 
             tx: { to: d.tx.to, value: d.tx.value, data: d.tx.data, gasLimit: d.tx.gas },
             decimals: 18, symbol: "UNK", routesData: getFakeRoutes("OKX", ""),
             ctx: { okxToNetworkId: params.toNetworkId, okxChainId: chainId }, fiatFee: 0.25
@@ -221,10 +230,7 @@ async function getChangeHeroQuote(params, amount, chainId) {
             decimals: 18, symbol: toSym.toUpperCase(), routesData: [{ subRoutes: [[{ name: "ChangeHero", percent: "100", logo: "https://uni.onekey-asset.com/static/logo/changeHeroFixed.png" }]] }],
             ctx: { isChangeHero: true }, fiatFee: 0.50
         };
-    } catch (e) { 
-        console.log(`   ❌ ChangeHero Failed: ${e.response?.status}`);
-        return null; 
-    }
+    } catch (e) { return null; } // Silent fail for ChangeHero
 }
 
 // ==================================================================
@@ -266,15 +272,12 @@ async function generateAllQuotes(params, eventId) {
             else if (p.id.includes('OKX')) q = await getOkxQuote(params, amount, fromChain);
             else if (p.id.includes('ChangeHero')) q = await getChangeHeroQuote(params, amount, fromChain);
         }
-        
-        // NO MOCK FALLBACK HERE. If q is null, we return null.
         if (!q) return null; 
-
         return formatQuote(p, params, q, eventId, i === 0);
     });
 
     const results = await Promise.all(promises);
-    return results.filter(r => r !== null); // Filter out failed providers
+    return results.filter(r => r !== null);
 }
 
 function formatQuote(providerConf, params, data, eventId, isBest) {
@@ -332,4 +335,4 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
 });
 
 app.use('/swap/v1', createProxyMiddleware({ target: 'https://swap.onekeycn.com', changeOrigin: true, logLevel: 'silent' }));
-app.listen(PORT, () => console.log(`Bitrabo v90 (Honest Mode) Running on ${PORT}`));
+app.listen(PORT, () => console.log(`Bitrabo v91 (Precision) Running on ${PORT}`));
