@@ -60,6 +60,8 @@ const PROVIDERS_CONFIG = [
 // 2. HELPERS
 // ==================================================================
 function getZeroXBaseUrl(chainId) {
+    // Force Number type for lookup
+    const id = Number(chainId);
     const map = {
         1: 'https://api.0x.org',
         56: 'https://bsc.api.0x.org',
@@ -69,7 +71,7 @@ function getZeroXBaseUrl(chainId) {
         43114: 'https://avalanche.api.0x.org',
         8453: 'https://base.api.0x.org'
     };
-    return map[chainId] || 'https://api.0x.org';
+    return map[id] || 'https://api.0x.org';
 }
 
 function toHex(val) {
@@ -95,10 +97,72 @@ function getFakeRoutes(providerName, logo) {
 }
 
 // ==================================================================
-// 3. REAL INTEGRATIONS (DYNAMIC DECIMALS)
+// 3. REAL INTEGRATIONS
 // ==================================================================
 
-// Note: Li.Fi handles decimals internally, so it was always correct
+// 0x: Fixed URL Mapping
+async function getZeroXQuote(params, amount, chainId, toDecimals) {
+    try {
+        const baseUrl = getZeroXBaseUrl(chainId);
+        // console.log(`   --> 0x Request: ${baseUrl} (Chain ${chainId})`);
+        
+        const resp = await axios.get(`${baseUrl}/swap/v1/quote`, {
+            headers: { '0x-api-key': KEYS.ZEROX },
+            params: {
+                sellToken: norm(params.fromTokenAddress), buyToken: norm(params.toTokenAddress),
+                sellAmount: amount, takerAddress: params.userAddress || "0x5555555555555555555555555555555555555555",
+                feeRecipient: FEE_RECEIVER, buyTokenPercentageFee: 0.0025, skipValidation: true 
+            }, timeout: TIMEOUT
+        });
+        
+        console.log(`   ✅ 0x Success`);
+        return {
+            toAmount: ethers.formatUnits(resp.data.buyAmount, toDecimals), 
+            tx: { to: resp.data.to, value: resp.data.value, data: resp.data.data, gasLimit: resp.data.gas },
+            decimals: toDecimals, symbol: "UNK", routesData: getFakeRoutes("0x", ""),
+            ctx: { zeroxChainId: chainId }, fiatFee: 0.15
+        };
+    } catch (e) { 
+        const url = getZeroXBaseUrl(chainId);
+        console.log(`   ❌ 0x Failed (${url}): ${e.response?.status}`); 
+        return null; 
+    }
+}
+
+// 1inch: Fixed Field Parsing & Fallback
+async function getOneInchQuote(params, amount, chainId, toDecimals) {
+    try {
+        // Try /swap first (Rich Data)
+        const resp = await axios.get(`https://api.1inch.dev/swap/v5.2/${chainId}/swap`, {
+            headers: { Authorization: `Bearer ${KEYS.ONEINCH}` },
+            params: {
+                src: norm(params.fromTokenAddress), dst: norm(params.toTokenAddress),
+                amount, from: params.userAddress || "0x5555555555555555555555555555555555555555",
+                slippage: 1, fee: 0.25, referrer: FEE_RECEIVER, disableEstimate: true 
+            }, timeout: TIMEOUT
+        });
+
+        // 1inch v5.2 returns 'toTokenAmount', v5.0 returned 'toAmount', v4 returned 'dstAmount'
+        const dstAmount = resp.data.toTokenAmount || resp.data.dstAmount || resp.data.toAmount;
+        
+        if (!dstAmount) {
+            console.log(`   ⚠️ 1inch Data Missing. Keys: ${Object.keys(resp.data)}`);
+            throw new Error("No amount field");
+        }
+
+        console.log("   ✅ 1inch Success");
+        return {
+            toAmount: ethers.formatUnits(dstAmount, toDecimals),
+            tx: { to: resp.data.tx.to, value: resp.data.tx.value, data: resp.data.tx.data, gasLimit: resp.data.tx.gas },
+            decimals: toDecimals, symbol: "UNK", routesData: getFakeRoutes("1inch", ""),
+            ctx: { oneInchChainId: 1 }, fiatFee: 0.20
+        };
+    } catch (e) { 
+        console.log(`   ❌ 1inch Failed: ${e.response?.status || e.message}`);
+        return null; 
+    }
+}
+
 async function getLifiQuote(params, amount, fromChain, toChain) {
     try {
         const fromToken = (!params.fromTokenAddress) ? '0x0000000000000000000000000000000000000000' : params.fromTokenAddress;
@@ -133,61 +197,6 @@ async function getLifiQuote(params, amount, fromChain, toChain) {
     } catch (e) { return null; }
 }
 
-// 0x: Added `toDecimals`
-async function getZeroXQuote(params, amount, chainId, toDecimals) {
-    try {
-        const baseUrl = getZeroXBaseUrl(chainId);
-        const resp = await axios.get(`${baseUrl}/swap/v1/quote`, {
-            headers: { '0x-api-key': KEYS.ZEROX },
-            params: {
-                sellToken: norm(params.fromTokenAddress), buyToken: norm(params.toTokenAddress),
-                sellAmount: amount, takerAddress: params.userAddress || "0x5555555555555555555555555555555555555555",
-                feeRecipient: FEE_RECEIVER, buyTokenPercentageFee: 0.0025, skipValidation: true 
-            }, timeout: TIMEOUT
-        });
-        
-        console.log(`   ✅ 0x Success`);
-        return {
-            toAmount: ethers.formatUnits(resp.data.buyAmount, toDecimals), // USE CORRECT DECIMALS
-            tx: { to: resp.data.to, value: resp.data.value, data: resp.data.data, gasLimit: resp.data.gas },
-            decimals: toDecimals, symbol: "UNK", routesData: getFakeRoutes("0x", ""),
-            ctx: { zeroxChainId: chainId }, fiatFee: 0.15
-        };
-    } catch (e) { 
-        console.log(`   ❌ 0x Failed: ${e.response?.status} URL: ${getZeroXBaseUrl(chainId)}`); 
-        return null; 
-    }
-}
-
-// 1inch: Added `toDecimals`
-async function getOneInchQuote(params, amount, chainId, toDecimals) {
-    try {
-        const resp = await axios.get(`https://api.1inch.dev/swap/v5.2/${chainId}/swap`, {
-            headers: { Authorization: `Bearer ${KEYS.ONEINCH}` },
-            params: {
-                src: norm(params.fromTokenAddress), dst: norm(params.toTokenAddress),
-                amount, from: params.userAddress || "0x5555555555555555555555555555555555555555",
-                slippage: 1, fee: 0.25, referrer: FEE_RECEIVER, disableEstimate: true 
-            }, timeout: TIMEOUT
-        });
-
-        const dstAmount = resp.data.dstAmount || resp.data.toTokenAmount;
-        if (!dstAmount) throw new Error("1inch: No amount");
-
-        console.log("   ✅ 1inch Success");
-        return {
-            toAmount: ethers.formatUnits(dstAmount, toDecimals), // USE CORRECT DECIMALS
-            tx: { to: resp.data.tx.to, value: resp.data.tx.value, data: resp.data.tx.data, gasLimit: resp.data.tx.gas },
-            decimals: toDecimals, symbol: "UNK", routesData: getFakeRoutes("1inch", ""),
-            ctx: { oneInchChainId: 1 }, fiatFee: 0.20
-        };
-    } catch (e) { 
-        console.log(`   ❌ 1inch Failed: ${e.response?.status}`);
-        return null; 
-    }
-}
-
-// OKX: Added `toDecimals`
 async function getOkxQuote(params, amount, chainId, toDecimals) {
     try {
         if(!params.userAddress) return null;
@@ -206,7 +215,7 @@ async function getOkxQuote(params, amount, chainId, toDecimals) {
 
         console.log("   ✅ OKX Success");
         return {
-            toAmount: ethers.formatUnits(outAmount, toDecimals), // USE CORRECT DECIMALS
+            toAmount: ethers.formatUnits(outAmount, toDecimals), 
             tx: { to: d.tx.to, value: d.tx.value, data: d.tx.data, gasLimit: d.tx.gas },
             decimals: toDecimals, symbol: "UNK", routesData: getFakeRoutes("OKX", ""),
             ctx: { okxToNetworkId: params.toNetworkId, okxChainId: chainId }, fiatFee: 0.25
@@ -250,21 +259,15 @@ app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
 app.get(['/swap/v1/check-support', '/check-support'], (req, res) => res.json(ok([{ status: 'available', networkId: req.query.networkId }])));
 app.get(['/swap/v1/allowance', '/allowance'], (req, res) => res.json(ok("0")));
 
-// ==================================================================
-// 5. AGGREGATOR (With Decimal Lookup)
-// ==================================================================
 async function generateAllQuotes(params, eventId) {
     const fromChain = parseInt(params.fromNetworkId.replace('evm--', ''));
     const toChain = parseInt(params.toNetworkId.replace('evm--', ''));
     let amount = params.fromTokenAmount;
-    let toDecimals = 18; // Default
+    let toDecimals = 18;
 
-    // 1. FETCH REAL DECIMALS (CRITICAL FIX)
     try { 
         const t = await getToken(fromChain, params.fromTokenAddress || '0x0000000000000000000000000000000000000000');
         amount = ethers.parseUnits(Number(amount).toFixed(t.decimals), t.decimals).toString();
-        
-        // Get Destination Decimals
         const toT = await getToken(toChain, params.toTokenAddress || '0x0000000000000000000000000000000000000000');
         toDecimals = toT.decimals || 18;
     } catch { 
@@ -275,7 +278,6 @@ async function generateAllQuotes(params, eventId) {
 
     const promises = PROVIDERS_CONFIG.map(async (p, i) => {
         let q = null;
-        // Pass toDecimals to all providers
         if (fromChain !== toChain) {
             if (p.id.includes('Lifi')) q = await getLifiQuote(params, amount, fromChain, toChain);
             else if (p.id.includes('ChangeHero')) q = await getChangeHeroQuote(params, amount, fromChain);
@@ -349,4 +351,4 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
 });
 
 app.use('/swap/v1', createProxyMiddleware({ target: 'https://swap.onekeycn.com', changeOrigin: true, logLevel: 'silent' }));
-app.listen(PORT, () => console.log(`Bitrabo v92 (Decimal Detective) Running on ${PORT}`));
+app.listen(PORT, () => console.log(`Bitrabo v93 (Router Fixed) Running on ${PORT}`));
