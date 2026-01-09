@@ -46,8 +46,36 @@ const jsonParser = express.json();
 const ok = (data) => ({ code: 0, message: "Success", data });
 
 // ==================================================================
-// 1. HELPERS
+// 1. DATA DEFINITIONS
 // ==================================================================
+const SUPPORTED_NETWORKS = [
+    { networkId: "evm--1", network: "ETH", name: "Ethereum", symbol: "ETH", decimals: 18, indexerSupported: true },
+    { networkId: "evm--56", network: "BNB", name: "BNB Chain", symbol: "BNB", decimals: 18, indexerSupported: true },
+    { networkId: "evm--137", network: "MATIC", name: "Polygon", symbol: "MATIC", decimals: 18, indexerSupported: true },
+    { networkId: "evm--42161", network: "ETH", name: "Arbitrum", symbol: "ETH", decimals: 18, indexerSupported: true },
+    { networkId: "evm--10", network: "ETH", name: "Optimism", symbol: "ETH", decimals: 18, indexerSupported: true },
+    { networkId: "evm--8453", network: "ETH", name: "Base", symbol: "ETH", decimals: 18, indexerSupported: true },
+    { networkId: "evm--43114", network: "AVAX", name: "Avalanche", symbol: "AVAX", decimals: 18, indexerSupported: true }
+];
+
+let PROVIDERS_CONFIG = [
+    { id: 'Swap1inch', name: '1inch', logo: 'https://uni.onekey-asset.com/static/logo/1inch.png' },
+    { id: 'SwapLifi', name: 'Li.fi (Bitrabo)', logo: 'https://uni.onekey-asset.com/static/logo/lifi.png' },
+    { id: 'Swap0x', name: '0x', logo: 'https://uni.onekey-asset.com/static/logo/0xlogo.png' },
+    { id: 'SwapOKX', name: 'OKX Dex', logo: 'https://uni.onekey-asset.com/static/logo/OKXDex.png' },
+    { id: 'SwapChangeHero', name: 'ChangeHero', logo: 'https://uni.onekey-asset.com/static/logo/changeHeroFixed.png' }
+];
+
+// ==================================================================
+// 2. HELPERS
+// ==================================================================
+function toHex(val) {
+    if (!val || val === '0') return "0x0";
+    try {
+        if (val.toString().startsWith('0x')) return val.toString();
+        return "0x" + new BigNumber(val).toString(16);
+    } catch { return "0x0"; }
+}
 
 function norm(addr) {
     if (!addr || addr === '' || addr === '0x0000000000000000000000000000000000000000') {
@@ -77,7 +105,7 @@ function calculateFiatFee(gasLimit, gasPrice, nativePriceUSD, chainId) {
 }
 
 // ==================================================================
-// 2. HEALTH CHECK
+// 3. HEALTH & STARTUP
 // ==================================================================
 async function verifyChangeHero() {
     if (!KEYS.CHANGEHERO) return false;
@@ -96,28 +124,81 @@ async function verifyChangeHero() {
 }
 
 // ==================================================================
-// 3. DATA
+// 4. CORE HANDLERS (Moved UP for Priority)
 // ==================================================================
-const SUPPORTED_NETWORKS = [
-    { networkId: "evm--1", network: "ETH", name: "Ethereum", symbol: "ETH", decimals: 18, indexerSupported: true },
-    { networkId: "evm--56", network: "BNB", name: "BNB Chain", symbol: "BNB", decimals: 18, indexerSupported: true },
-    { networkId: "evm--137", network: "MATIC", name: "Polygon", symbol: "MATIC", decimals: 18, indexerSupported: true },
-    { networkId: "evm--42161", network: "ETH", name: "Arbitrum", symbol: "ETH", decimals: 18, indexerSupported: true },
-    { networkId: "evm--10", network: "ETH", name: "Optimism", symbol: "ETH", decimals: 18, indexerSupported: true },
-    { networkId: "evm--8453", network: "ETH", name: "Base", symbol: "ETH", decimals: 18, indexerSupported: true },
-    { networkId: "evm--43114", network: "AVAX", name: "Avalanche", symbol: "AVAX", decimals: 18, indexerSupported: true }
-];
 
-let PROVIDERS_CONFIG = [
-    { id: 'Swap1inch', name: '1inch', logo: 'https://uni.onekey-asset.com/static/logo/1inch.png' },
-    { id: 'SwapLifi', name: 'Li.fi (Bitrabo)', logo: 'https://uni.onekey-asset.com/static/logo/lifi.png' },
-    { id: 'Swap0x', name: '0x', logo: 'https://uni.onekey-asset.com/static/logo/0xlogo.png' },
-    { id: 'SwapOKX', name: 'OKX Dex', logo: 'https://uni.onekey-asset.com/static/logo/OKXDex.png' },
-    { id: 'SwapChangeHero', name: 'ChangeHero', logo: 'https://uni.onekey-asset.com/static/logo/changeHeroFixed.png' }
-];
+// ⚡ v104: Route is now at the TOP to prevent Proxy Fallthrough
+app.get(['/swap/v1/quote/events', '/swap/v1/quote'], async (req, res) => {
+    // ⚡ LOGGING: Prove that we hit the local server
+    console.log(`⚡ LOCAL QUOTE REQUEST CAUGHT: ${req.url.split('?')[0]}`);
+    
+    res.setHeader('Content-Type', 'text/event-stream');
+    const eventId = uuidv4();
+    try {
+        const quotes = await generateAllQuotes(req.query, eventId);
+        res.write(`data: ${JSON.stringify({ totalQuoteCount: quotes.length, eventId })}\n\n`);
+        res.write(`data: ${JSON.stringify({ autoSuggestedSlippage: 0.5, eventId, ...req.query })}\n\n`);
+        for (const q of quotes) res.write(`data: ${JSON.stringify({ data: [q] })}\n\n`);
+        res.write(`data: {"type":"done"}\n\n`);
+    } catch (e) { res.write(`data: {"type":"error"}\n\n`); }
+    res.end();
+});
+
+// ⚡ v104: Debugging Build-TX Payload
+app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
+    console.log("   📝 /build-tx called by Frontend");
+    
+    // Log the actual body to see what's missing
+    if (!req.body || !req.body.quoteResultCtx) {
+        console.log("   ❌ /build-tx Payload Dump:", JSON.stringify(req.body)); 
+        return res.json(ok(null));
+    }
+
+    const { quoteResultCtx, userAddress } = req.body;
+
+    try {
+        const valStr = new BigNumber(quoteResultCtx.tx.value).toFixed(0);
+        const gasNum = Number(quoteResultCtx.tx.gas || quoteResultCtx.tx.gasLimit || 500000);
+        const feeAmount = new BigNumber(quoteResultCtx.toAmount || 0).multipliedBy(FEE_PERCENT).toFixed(6);
+
+        const responseData = {
+            result: { 
+                info: { 
+                    provider: quoteResultCtx.providerId,
+                    providerName: quoteResultCtx.providerId.replace("Swap", ""),
+                    providerLogo: "https://uni.onekey-asset.com/static/logo/OKXDex.png" 
+                }, 
+                protocol: 'Swap', 
+                kind: 'sell',
+                fee: { percentageFee: FEE_PERCENT * 100 }, 
+                routesData: quoteResultCtx.routesData || [],
+                estimatedTime: 30,
+                fromAmount: quoteResultCtx.fromAmount, 
+                toAmount: quoteResultCtx.toAmount,
+                supportUrl: "https://help.onekey.so/hc/requests/new",
+                unSupportReceiveAddressDifferent: false,
+                oneKeyFeeExtraInfo: { oneKeyFeeAmount: feeAmount, oneKeyFeeSymbol: "TOKEN", oneKeyFeeUsd: "0.10" },
+                gasLimit: gasNum,
+                slippage: 0.5
+            },
+            ctx: quoteResultCtx, 
+            tx: { to: quoteResultCtx.tx.to, value: valStr, data: quoteResultCtx.tx.data },
+            orderId: uuidv4()
+        };
+
+        console.log("   ✅ /build-tx Success. Sending JSON.");
+        return res.json(ok(responseData));
+
+    } catch (e) { 
+        console.log(`   ❌ /build-tx Error: ${e.message}`);
+        return res.json(ok(null)); 
+    }
+});
+
+app.post('/swap/v1/quote/verify', jsonParser, (req, res) => res.json(ok({ result: true })));
 
 // ==================================================================
-// 4. REAL INTEGRATIONS
+// 5. PROVIDER INTEGRATIONS
 // ==================================================================
 
 async function getZeroXQuote(params, amount, chainId, toDecimals, nativePriceUSD) {
@@ -231,8 +312,9 @@ async function getLifiQuote(params, amount, fromChain, toChain) {
 }
 
 // ==================================================================
-// 5. LOCAL ENDPOINTS
+// 6. GENERATOR LOGIC
 // ==================================================================
+
 app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
     const list = PROVIDERS_CONFIG.map(p => ({
         providerInfo: { provider: p.id, name: p.name, logo: p.logo, protocol: "Swap" },
@@ -310,75 +392,8 @@ function formatQuote(providerConf, params, data, eventId, isBest) {
     };
 }
 
-app.post('/swap/v1/quote/verify', jsonParser, (req, res) => res.json(ok({ result: true })));
-
-// ⚡ v103: The "Golden JSON" Fix
-app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
-    console.log("   📝 /build-tx called by Frontend");
-    const { quoteResultCtx, userAddress } = req.body;
-    
-    if (!quoteResultCtx || !quoteResultCtx.tx) {
-        console.log("   ❌ /build-tx Failed: Missing quote context");
-        return res.json(ok(null));
-    }
-
-    try {
-        // 1. Value must be a DECIMAL STRING (from your Golden JSON log)
-        const valStr = new BigNumber(quoteResultCtx.tx.value).toFixed(0);
-
-        // 2. Gas must be a Number, inside the result object
-        const gasNum = Number(quoteResultCtx.tx.gas || quoteResultCtx.tx.gasLimit || 500000);
-
-        // 3. Calculated Fee Info
-        const feeAmount = new BigNumber(quoteResultCtx.toAmount || 0).multipliedBy(FEE_PERCENT).toFixed(6);
-
-        // 4. Construct response exactly matching Golden JSON
-        const responseData = {
-            result: { 
-                info: { 
-                    provider: quoteResultCtx.providerId,
-                    providerName: quoteResultCtx.providerId.replace("Swap", ""), // Clean name
-                    providerLogo: "https://uni.onekey-asset.com/static/logo/OKXDex.png" // Fallback or dynamic
-                }, 
-                fromTokenInfo: { /* ...populated by frontend usually, or we can echo... */ },
-                toTokenInfo: { /* ...populated by frontend... */ },
-                protocol: 'Swap', 
-                kind: 'sell',
-                fee: { percentageFee: FEE_PERCENT * 100 }, 
-                routesData: quoteResultCtx.routesData || [],
-                estimatedTime: 30,
-                fromAmount: quoteResultCtx.fromAmount, // Ensure these exist in CTX if possible
-                toAmount: quoteResultCtx.toAmount,
-                supportUrl: "https://help.onekey.so/hc/requests/new",
-                unSupportReceiveAddressDifferent: false,
-                oneKeyFeeExtraInfo: { 
-                    oneKeyFeeAmount: feeAmount, 
-                    oneKeyFeeSymbol: "TOKEN", 
-                    oneKeyFeeUsd: "0.10" 
-                },
-                gasLimit: gasNum, // Number!
-                slippage: 0.5
-            },
-            ctx: quoteResultCtx, 
-            tx: { 
-                to: quoteResultCtx.tx.to, 
-                value: valStr, // Decimal String!
-                data: quoteResultCtx.tx.data 
-            },
-            orderId: uuidv4()
-        };
-
-        console.log("   ✅ /build-tx Success. Sending JSON.");
-        return res.json(ok(responseData));
-
-    } catch (e) { 
-        console.log(`   ❌ /build-tx Error: ${e.message}`);
-        return res.json(ok(null)); 
-    }
-});
-
 // ==================================================================
-// 6. FALLBACK PROXY
+// 7. FALLBACK PROXY (At the very bottom now)
 // ==================================================================
 app.use('/swap/v1', (req, res, next) => {
     console.log(`⚠️ Proxying to OneKey: ${req.path}`);
@@ -387,7 +402,7 @@ app.use('/swap/v1', (req, res, next) => {
 app.use('/swap/v1', createProxyMiddleware({ target: 'https://swap.onekeycn.com', changeOrigin: true, logLevel: 'silent' }));
 
 app.listen(PORT, async () => {
-    console.log(`Bitrabo v103 (Golden JSON Fix) Running on ${PORT}`);
+    console.log(`Bitrabo v104 (Priority Fix) Running on ${PORT}`);
     const isChangeHeroAlive = await verifyChangeHero();
     if (!isChangeHeroAlive) PROVIDERS_CONFIG = PROVIDERS_CONFIG.filter(p => p.id !== 'SwapChangeHero');
 });
