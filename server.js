@@ -80,9 +80,21 @@ function calculateFiatFee(gasLimit, gasPrice, nativePriceUSD, chainId) {
         const totalNative = totalWei.div(1e18); 
         const usdFee = totalNative.multipliedBy(nativePriceUSD);
         return parseFloat(usdFee.toFixed(2));
-    } catch (e) {
-        return 0.15; 
-    }
+    } catch (e) { return 0.15; }
+}
+
+// ⚡ HELPER: Format Token Info EXACTLY like OneKey Golden JSON
+function formatTokenInfo(tokenObj, networkId) {
+    const isNative = (!tokenObj.address || tokenObj.address === '0x0000000000000000000000000000000000000000');
+    return {
+        contractAddress: isNative ? "" : tokenObj.address, // ⚡ FORCE EMPTY STRING FOR NATIVE
+        networkId: networkId,
+        isNative: isNative, // ⚡ EXPLICIT BOOLEAN
+        decimals: tokenObj.decimals || 18,
+        name: tokenObj.name || "Token",
+        symbol: tokenObj.symbol || "UNK",
+        logoURI: tokenObj.logoURI || "https://uni.onekey-asset.com/static/logo/default_token.png"
+    };
 }
 
 // ==================================================================
@@ -90,18 +102,13 @@ function calculateFiatFee(gasLimit, gasPrice, nativePriceUSD, chainId) {
 // ==================================================================
 async function verifyChangeHero() {
     if (!KEYS.CHANGEHERO) return false;
-    console.log("🕵️ Checking ChangeHero Connection...");
     try {
         await axios.get(`https://api.changehero.io/v2/exchange-amount`, {
             params: { api_key: KEYS.CHANGEHERO, from: 'btc', to: 'eth', amount: '0.1' },
             headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 5000
         });
-        console.log("   ✅ ChangeHero is ONLINE.");
         return true;
-    } catch (e) {
-        console.log(`   ⚠️ ChangeHero Check Failed: ${e.response?.status}`);
-        return false;
-    }
+    } catch (e) { return false; }
 }
 
 // ==================================================================
@@ -123,14 +130,10 @@ app.get(['/swap/v1/quote/events', '/swap/v1/quote'], async (req, res) => {
     res.end();
 });
 
-// BUILD-TX ENDPOINT (Updated for v105)
+// BUILD-TX ENDPOINT
 app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
     console.log("   📝 /build-tx called by Frontend");
-    
-    if (!req.body || !req.body.quoteResultCtx) {
-        console.log("   ❌ /build-tx Payload Dump:", JSON.stringify(req.body)); 
-        return res.json(ok(null));
-    }
+    if (!req.body || !req.body.quoteResultCtx) return res.json(ok(null));
 
     const { quoteResultCtx, userAddress } = req.body;
 
@@ -139,11 +142,9 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
         const gasNum = Number(quoteResultCtx.tx.gas || quoteResultCtx.tx.gasLimit || 500000);
         const feeAmount = new BigNumber(quoteResultCtx.toAmount || 0).multipliedBy(FEE_PERCENT).toFixed(6);
 
-        // ⚡ RECOVERY: We pull Token Info back out of the CTX to send it back to Frontend
-        // This fixes the "Est. Received" spinner because now the frontend knows decimals/symbols.
+        // ⚡ RECOVERY: Use persisted Token Info
         const fromTokenInfo = quoteResultCtx.fromTokenInfo || {};
         const toTokenInfo = quoteResultCtx.toTokenInfo || {};
-        const instantRate = quoteResultCtx.instantRate || "0";
 
         const responseData = {
             result: { 
@@ -152,42 +153,28 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
                     providerName: quoteResultCtx.providerId.replace("Swap", ""),
                     providerLogo: "https://uni.onekey-asset.com/static/logo/OKXDex.png" 
                 }, 
-                fromTokenInfo: fromTokenInfo, // ⚡ PASSED BACK
-                toTokenInfo: toTokenInfo,     // ⚡ PASSED BACK
-                protocol: 'Swap', 
-                kind: 'sell',
+                fromTokenInfo, toTokenInfo,
+                protocol: 'Swap', kind: 'sell',
                 fee: { percentageFee: FEE_PERCENT * 100 }, 
                 routesData: quoteResultCtx.routesData || [],
                 estimatedTime: 30,
                 fromAmount: quoteResultCtx.fromAmount, 
                 toAmount: quoteResultCtx.toAmount,
-                instantRate: instantRate,     // ⚡ PASSED BACK
+                instantRate: quoteResultCtx.instantRate,
                 supportUrl: "https://help.onekey.so/hc/requests/new",
                 unSupportReceiveAddressDifferent: false,
-                oneKeyFeeExtraInfo: { 
-                    oneKeyFeeAmount: feeAmount, 
-                    oneKeyFeeSymbol: fromTokenInfo.symbol || "TOKEN", // ⚡ REAL SYMBOL
-                    oneKeyFeeUsd: "0.10" 
-                },
+                oneKeyFeeExtraInfo: { oneKeyFeeAmount: feeAmount, oneKeyFeeSymbol: fromTokenInfo.symbol || "TOKEN", oneKeyFeeUsd: "0.10" },
                 gasLimit: gasNum,
                 slippage: 0.5
             },
             ctx: quoteResultCtx, 
-            tx: { 
-                to: quoteResultCtx.tx.to, 
-                value: valStr, 
-                data: quoteResultCtx.tx.data 
-            },
+            tx: { to: quoteResultCtx.tx.to, value: valStr, data: quoteResultCtx.tx.data },
             orderId: uuidv4()
         };
 
-        console.log("   ✅ /build-tx Success. Sending JSON.");
+        console.log("   ✅ /build-tx Success.");
         return res.json(ok(responseData));
-
-    } catch (e) { 
-        console.log(`   ❌ /build-tx Error: ${e.message}`);
-        return res.json(ok(null)); 
-    }
+    } catch (e) { return res.json(ok(null)); }
 });
 
 app.post('/swap/v1/quote/verify', jsonParser, (req, res) => res.json(ok({ result: true })));
@@ -349,31 +336,35 @@ async function generateAllQuotes(params, eventId) {
     let toSymbol = "USDT";
     let nativePriceUSD = 0;
     
-    // ⚡ PREPARE TOKEN INFO FOR CTX (This fixes "Est. Received" Spinner)
-    let fromTokenInfo = { contractAddress: params.fromTokenAddress || "", networkId: params.fromNetworkId, decimals: 18, symbol: "ETH" };
-    let toTokenInfo = { contractAddress: params.toTokenAddress, networkId: params.toNetworkId, decimals: 18, symbol: "UNK" };
-
+    // ⚡ PREPARE TOKEN INFO (STRICT FORMATTING)
+    // 1. Get raw info
+    let fromT, toT, nativeToken;
     try { 
-        const t = await getToken(fromChain, params.fromTokenAddress || '0x0000000000000000000000000000000000000000');
-        fromSymbol = t.symbol;
-        fromTokenInfo = { contractAddress: t.address, networkId: params.fromNetworkId, decimals: t.decimals, symbol: t.symbol, logoURI: t.logoURI };
-        amount = ethers.parseUnits(Number(amount).toFixed(t.decimals), t.decimals).toString();
-
-        const toT = await getToken(toChain, params.toTokenAddress || '0x0000000000000000000000000000000000000000');
-        toSymbol = toT.symbol;
+        fromT = await getToken(fromChain, params.fromTokenAddress || '0x0000000000000000000000000000000000000000');
+        toT = await getToken(toChain, params.toTokenAddress || '0x0000000000000000000000000000000000000000');
+        nativeToken = await getToken(fromChain, '0x0000000000000000000000000000000000000000');
+        
+        amount = ethers.parseUnits(Number(amount).toFixed(fromT.decimals), fromT.decimals).toString();
         toDecimals = toT.decimals || 18;
-        toTokenInfo = { contractAddress: toT.address, networkId: params.toNetworkId, decimals: toT.decimals, symbol: toT.symbol, logoURI: toT.logoURI };
-
-        const nativeToken = await getToken(fromChain, '0x0000000000000000000000000000000000000000');
+        fromSymbol = fromT.symbol;
+        toSymbol = toT.symbol;
         nativePriceUSD = parseFloat(nativeToken.priceUSD || 0);
-    } catch { 
+
+    } catch (e) { 
+        // Fallback for safety
         amount = ethers.parseUnits(Number(amount).toFixed(18), 18).toString(); 
+        fromT = { address: params.fromTokenAddress, decimals: 18, symbol: 'ETH' };
+        toT = { address: params.toTokenAddress, decimals: 18, symbol: 'UNK' };
     }
 
-    console.log(`[🔍 AGGREGATOR] Fetching (Native Price: $${nativePriceUSD})...`);
-    const isNative = (!params.fromTokenAddress || params.fromTokenAddress === '0x0000000000000000000000000000000000000000');
+    // 2. Format Info using Helper (Fixes the "Empty Address" vs "0x000" issue)
+    const fromTokenInfo = formatTokenInfo(fromT, params.fromNetworkId);
+    const toTokenInfo = formatTokenInfo(toT, params.toNetworkId);
 
-    // ⚡ ENHANCED CTX: We inject token info here so it survives the round-trip
+    console.log(`[🔍 AGGREGATOR] Fetching (Native Price: $${nativePriceUSD})...`);
+    const isNative = fromTokenInfo.isNative;
+
+    // 3. Enrich Params
     const enrichedParams = { ...params, fromTokenInfo, toTokenInfo };
 
     const promises = PROVIDERS_CONFIG.map(async (p, i) => {
@@ -401,14 +392,13 @@ function formatQuote(providerConf, params, data, eventId, isBest) {
     const rate = new BigNumber(data.toAmount).div(params.fromTokenAmount).toFixed();
     return {
         info: { provider: providerConf.id, providerName: providerConf.name, providerLogo: providerConf.logo },
-        fromTokenInfo: params.fromTokenInfo, // ⚡ Use Enriched Info
-        toTokenInfo: params.toTokenInfo,     // ⚡ Use Enriched Info
+        fromTokenInfo: params.fromTokenInfo, // ⚡ STRICT INFO
+        toTokenInfo: params.toTokenInfo,     // ⚡ STRICT INFO
         protocol: 'Swap', kind: 'sell',
         fromAmount: params.fromTokenAmount, toAmount: data.toAmount,
         instantRate: rate, estimatedTime: 30,
         fee: { percentageFee: FEE_PERCENT * 100, estimatedFeeFiatValue: data.fiatFee || 0.1, protocolFees: 0 },
         routesData: data.routesData,
-        // ⚡ PERSIST DATA: Store token info & rate inside the context
         quoteResultCtx: { 
             tx: data.tx, 
             providerId: providerConf.id, 
@@ -436,7 +426,7 @@ app.use('/swap/v1', (req, res, next) => {
 app.use('/swap/v1', createProxyMiddleware({ target: 'https://swap.onekeycn.com', changeOrigin: true, logLevel: 'silent' }));
 
 app.listen(PORT, async () => {
-    console.log(`Bitrabo v105 (Data Persistence Fix) Running on ${PORT}`);
+    console.log(`Bitrabo v106 (Strict Token Formatting) Running on ${PORT}`);
     const isChangeHeroAlive = await verifyChangeHero();
     if (!isChangeHeroAlive) PROVIDERS_CONFIG = PROVIDERS_CONFIG.filter(p => p.id !== 'SwapChangeHero');
 });
