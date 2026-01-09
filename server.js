@@ -20,8 +20,6 @@ const TIMEOUT = 15000;
 
 createConfig({ integrator: LIFI_INTEGRATOR, fee: FEE_PERCENT });
 
-// ⚡ v99: Gas Price Fallbacks (in Wei) for when APIs don't provide them.
-// High enough to be safe estimates for UI display.
 const GAS_PRICE_ESTIMATES = {
     1: "30000000000",      // ETH: 30 Gwei
     56: "3000000000",      // BNB: 3 Gwei
@@ -32,6 +30,7 @@ const GAS_PRICE_ESTIMATES = {
     43114: "25000000000"   // Avalanche: 25 Gwei
 };
 
+// ⚡ v100: Strict Key Trimming
 const KEYS = {
     ZEROX: process.env.ZEROX_API_KEY ? process.env.ZEROX_API_KEY.trim() : undefined,
     ONEINCH: process.env.ONEINCH_API_KEY ? process.env.ONEINCH_API_KEY.trim() : undefined,
@@ -93,30 +92,21 @@ function getFakeRoutes(providerName, logo) {
     return [{ subRoutes: [[{ name: providerName, percent: "100", logo: logo }]] }];
 }
 
-// ⚡ HELPER: Calculate Fiat Fee (Gas Limit * Gas Price * Native Price)
 function calculateFiatFee(gasLimit, gasPrice, nativePriceUSD, chainId) {
     try {
-        // 1. Get Gas Price (Use provided or fallback)
         const priceWei = gasPrice ? new BigNumber(gasPrice) : new BigNumber(GAS_PRICE_ESTIMATES[chainId] || "3000000000");
-        
-        // 2. Get Gas Limit
         const limit = new BigNumber(gasLimit || 200000);
-
-        // 3. Calculate Total ETH/BNB needed
         const totalWei = limit.multipliedBy(priceWei);
-        const totalNative = totalWei.div(1e18); // Wei to Ether
-
-        // 4. Convert to USD
+        const totalNative = totalWei.div(1e18); 
         const usdFee = totalNative.multipliedBy(nativePriceUSD);
-        
         return parseFloat(usdFee.toFixed(2));
     } catch (e) {
-        return 0.15; // Safe fallback
+        return 0.15; 
     }
 }
 
 // ==================================================================
-// 3. STARTUP HEALTH CHECK
+// 3. HEALTH & STARTUP
 // ==================================================================
 async function verifyChangeHero() {
     if (!KEYS.CHANGEHERO) return false;
@@ -135,10 +125,9 @@ async function verifyChangeHero() {
 }
 
 // ==================================================================
-// 4. REAL INTEGRATIONS (With Dynamic Fee Params)
+// 4. REAL INTEGRATIONS
 // ==================================================================
 
-// 0x (V2)
 async function getZeroXQuote(params, amount, chainId, toDecimals, nativePriceUSD) {
     try {
         const resp = await axios.get(`https://api.0x.org/swap/allowance-holder/quote`, {
@@ -150,10 +139,7 @@ async function getZeroXQuote(params, amount, chainId, toDecimals, nativePriceUSD
             }, timeout: TIMEOUT
         });
         const d = resp.data;
-        
-        // ⚡ Dynamic Fee Calculation
         const fiatFee = calculateFiatFee(d.transaction.gas, d.transaction.gasPrice, nativePriceUSD, chainId);
-
         return {
             toAmount: ethers.formatUnits(d.buyAmount, toDecimals), 
             tx: { to: d.transaction.to, value: d.transaction.value, data: d.transaction.data, gasLimit: d.transaction.gas },
@@ -163,7 +149,6 @@ async function getZeroXQuote(params, amount, chainId, toDecimals, nativePriceUSD
     } catch (e) { console.log(`   ❌ 0x Failed: ${e.message}`); return null; }
 }
 
-// 1inch
 async function getOneInchQuote(params, amount, chainId, toDecimals, nativePriceUSD) {
     try {
         const resp = await axios.get(`https://api.1inch.dev/swap/v5.2/${chainId}/swap`, {
@@ -177,10 +162,7 @@ async function getOneInchQuote(params, amount, chainId, toDecimals, nativePriceU
         const d = resp.data;
         const dstAmount = d.toTokenAmount || d.dstAmount || d.toAmount;
         if (!dstAmount) throw new Error("No amount");
-        
-        // ⚡ Dynamic Fee Calculation (1inch usually returns gasPrice in tx)
         const fiatFee = calculateFiatFee(d.tx.gas, d.tx.gasPrice, nativePriceUSD, chainId);
-
         return {
             toAmount: ethers.formatUnits(dstAmount, toDecimals),
             tx: { to: d.tx.to, value: d.tx.value, data: d.tx.data, gasLimit: d.tx.gas },
@@ -190,7 +172,6 @@ async function getOneInchQuote(params, amount, chainId, toDecimals, nativePriceU
     } catch (e) { console.log(`   ❌ 1inch Failed: ${e.response?.status}`); return null; }
 }
 
-// OKX
 async function getOkxQuote(params, amount, chainId, toDecimals, nativePriceUSD) {
     try {
         if(!params.userAddress) return null;
@@ -203,10 +184,7 @@ async function getOkxQuote(params, amount, chainId, toDecimals, nativePriceUSD) 
         if (resp.data.code !== '0' || !resp.data.data[0]) return null;
         const d = resp.data.data[0];
         const outAmount = d.toTokenAmount || d.routerResult?.toTokenAmount;
-        
-        // ⚡ Dynamic Fee Calculation
         const fiatFee = calculateFiatFee(d.tx.gas, d.tx.gasPrice, nativePriceUSD, chainId);
-
         return {
             toAmount: ethers.formatUnits(outAmount, toDecimals), 
             tx: { to: d.tx.to, value: d.tx.value, data: d.tx.data, gasLimit: d.tx.gas },
@@ -216,7 +194,6 @@ async function getOkxQuote(params, amount, chainId, toDecimals, nativePriceUSD) 
     } catch (e) { return null; }
 }
 
-// ChangeHero
 async function getChangeHeroQuote(params, amount, chainId, fromTicker, toTicker, nativePriceUSD, isNative) {
     try {
         if(!fromTicker || !toTicker) return null;
@@ -225,12 +202,8 @@ async function getChangeHeroQuote(params, amount, chainId, fromTicker, toTicker,
             params: { api_key: KEYS.CHANGEHERO, from: fromTicker.toLowerCase(), to: toTicker.toLowerCase(), amount: readableAmount }, 
             headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: TIMEOUT
         });
-
-        // ⚡ Dynamic Fee Calculation (Transfer cost)
-        // If sending Native (ETH): ~21,000 gas. If Token (USDT): ~65,000 gas.
         const gasLimit = isNative ? 21000 : 65000;
         const fiatFee = calculateFiatFee(gasLimit, null, nativePriceUSD, chainId);
-
         return {
             toAmount: String(resp.data.estimated_amount),
             tx: { to: "0xChangeHeroDepositAddr", value: amount, data: "0x", gasLimit: 21000 }, 
@@ -240,7 +213,6 @@ async function getChangeHeroQuote(params, amount, chainId, fromTicker, toTicker,
     } catch (e) { return null; }
 }
 
-// Li.Fi (Already has dynamic fees built-in)
 async function getLifiQuote(params, amount, fromChain, toChain) {
     try {
         const routesPromise = getRoutes({
@@ -252,15 +224,12 @@ async function getLifiQuote(params, amount, fromChain, toChain) {
         });
         const routes = await Promise.race([routesPromise, new Promise((_, r) => setTimeout(() => r(new Error("Timeout")), TIMEOUT))]);
         if (!routes.routes?.length) return null;
-        
         const route = routes.routes[0];
         const step = route.steps[0];
         const tx = await getStepTransaction(step);
-        
         const richCtx = { lifiQuoteResultCtx: { stepInfo: step, estimate: step.estimate, includedSteps: route.steps }, lifiToNetworkId: params.toNetworkId };
         const fiatFee = step.estimate?.feeCosts?.[0]?.amountUSD || 0.1;
         const gasCostUSD = step.estimate?.gasCosts?.[0]?.amountUSD || 0.1;
-
         return {
             toAmount: ethers.formatUnits(route.toAmount, route.toToken.decimals),
             tx, decimals: route.toToken.decimals, symbol: route.toToken.symbol,
@@ -270,8 +239,9 @@ async function getLifiQuote(params, amount, fromChain, toChain) {
 }
 
 // ==================================================================
-// 5. ENDPOINTS & LOGIC
+// 5. LOCAL ENDPOINTS (These Handle Quotes 100% Locally)
 // ==================================================================
+
 app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
     const list = PROVIDERS_CONFIG.map(p => ({
         providerInfo: { provider: p.id, name: p.name, logo: p.logo, protocol: "Swap" },
@@ -292,35 +262,26 @@ async function generateAllQuotes(params, eventId) {
     let toDecimals = 18;
     let fromSymbol = "ETH";
     let toSymbol = "USDT";
-    let nativePriceUSD = 0; // ⚡ Store the native price here
+    let nativePriceUSD = 0;
 
     try { 
-        // ⚡ 1. Fetch From Token Details
         const t = await getToken(fromChain, params.fromTokenAddress || '0x0000000000000000000000000000000000000000');
         fromSymbol = t.symbol;
         amount = ethers.parseUnits(Number(amount).toFixed(t.decimals), t.decimals).toString();
-
-        // ⚡ 2. Fetch Destination Token Details
         const toT = await getToken(toChain, params.toTokenAddress || '0x0000000000000000000000000000000000000000');
         toSymbol = toT.symbol;
         toDecimals = toT.decimals || 18;
-
-        // ⚡ 3. CRITICAL: Fetch Native Token Price for Dynamic Fees
-        // We ask for the zero address (Native Token) of the FROM chain
         const nativeToken = await getToken(fromChain, '0x0000000000000000000000000000000000000000');
         nativePriceUSD = parseFloat(nativeToken.priceUSD || 0);
-
     } catch { 
         amount = ethers.parseUnits(Number(amount).toFixed(18), 18).toString(); 
     }
 
     console.log(`[🔍 AGGREGATOR] Fetching (Native Price: $${nativePriceUSD})...`);
-
     const isNative = (!params.fromTokenAddress || params.fromTokenAddress === '0x0000000000000000000000000000000000000000');
 
     const promises = PROVIDERS_CONFIG.map(async (p, i) => {
         let q = null;
-        // ⚡ Pass nativePriceUSD to all providers
         if (fromChain !== toChain) {
             if (p.id.includes('Lifi')) q = await getLifiQuote(params, amount, fromChain, toChain);
             else if (p.id.includes('ChangeHero')) q = await getChangeHeroQuote(params, amount, fromChain, fromSymbol, toSymbol, nativePriceUSD, isNative);
@@ -358,6 +319,19 @@ function formatQuote(providerConf, params, data, eventId, isBest) {
     };
 }
 
+app.get('/swap/v1/quote/events', async (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    const eventId = uuidv4();
+    try {
+        const quotes = await generateAllQuotes(req.query, eventId);
+        res.write(`data: ${JSON.stringify({ totalQuoteCount: quotes.length, eventId })}\n\n`);
+        res.write(`data: ${JSON.stringify({ autoSuggestedSlippage: 0.5, eventId, ...req.query })}\n\n`);
+        for (const q of quotes) res.write(`data: ${JSON.stringify({ data: [q] })}\n\n`);
+        res.write(`data: {"type":"done"}\n\n`);
+    } catch (e) { res.write(`data: {"type":"error"}\n\n`); }
+    res.end();
+});
+
 app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
     const { quoteResultCtx, userAddress } = req.body;
     if (!quoteResultCtx || !quoteResultCtx.tx) return res.json(ok(null));
@@ -381,10 +355,22 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
     } catch (e) { return res.json(ok(null)); }
 });
 
+// ==================================================================
+// 6. FALLBACK PROXY (Safety Net)
+// ==================================================================
+
+// ⚡ v100: Logging Middleware to see what is being proxied
+app.use('/swap/v1', (req, res, next) => {
+    // If execution reaches here, it means NO local route matched the request.
+    // We log it so you know exactly what is "Falling through" to OneKey.
+    console.log(`⚠️ Proxying to OneKey: ${req.path}`);
+    next();
+});
+
 app.use('/swap/v1', createProxyMiddleware({ target: 'https://swap.onekeycn.com', changeOrigin: true, logLevel: 'silent' }));
 
 app.listen(PORT, async () => {
-    console.log(`Bitrabo v99 (Dynamic Fees) Running on ${PORT}`);
+    console.log(`Bitrabo v100 (Transparent Proxy) Running on ${PORT}`);
     const isChangeHeroAlive = await verifyChangeHero();
     if (!isChangeHeroAlive) PROVIDERS_CONFIG = PROVIDERS_CONFIG.filter(p => p.id !== 'SwapChangeHero');
 });
