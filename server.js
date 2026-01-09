@@ -119,21 +119,22 @@ async function getZeroXQuote(params, amount, chainId, fromToken, toToken) {
     const baseUrl = getZeroXBaseUrl(chainId);
     const sellToken = fromToken.address === NATIVE_ADDRESSES.LIFI ? NATIVE_ADDRESSES.ZEROX : fromToken.address;
     const buyToken = toToken.address === NATIVE_ADDRESSES.LIFI ? NATIVE_ADDRESSES.ZEROX : toToken.address;
-    const resp = await axios.get(`${baseUrl}/swap/v1/quote`, {
+    const resp = await axios.get(`${baseUrl}/swap/allowance-holder/quote`, {
         headers: { '0x-api-key': KEYS.ZEROX },
         params: {
             sellToken,
             buyToken,
             sellAmount: amount,
-            takerAddress: params.userAddress,
+            taker: params.userAddress,
             feeRecipient: FEE_RECEIVER,
             buyTokenPercentageFee: FEE_PERCENT
         }
     });
+    if (!resp.data.buyAmount || !resp.data.transaction) throw new Error("Incomplete 0x data");
     return {
         toAmount: ethers.formatUnits(resp.data.buyAmount, toToken.decimals),
         tx: {
-            to: resp.data.to, value: resp.data.value, data: resp.data.data, gasLimit: resp.data.gas
+            to: resp.data.transaction.to, value: resp.data.transaction.value, data: resp.data.transaction.data, gasLimit: resp.data.transaction.gas
         },
         decimals: toToken.decimals,
         symbol: toToken.symbol,
@@ -155,6 +156,7 @@ async function getOneInchQuote(params, amount, chainId, fromToken, toToken) {
             fee: FEE_PERCENT * 100, referrer: FEE_RECEIVER
         }
     });
+    if (!resp.data.dstAmount || !resp.data.tx) throw new Error("Incomplete 1inch data");
     return {
         toAmount: ethers.formatUnits(resp.data.dstAmount, toToken.decimals),
         tx: {
@@ -186,10 +188,7 @@ async function getOkxQuote(params, amount, chainId, fromToken, toToken) {
         });
         if (resp.data.code !== '0') throw new Error(`OKX: ${resp.data.msg}`);
         const d = resp.data.data[0];
-        if (!d || !d.toTokenAmount) throw new Error("No OKX quote data");
-        // Extract real routes from OKX response if available; fallback to log-like structure
-        // Assuming d.routerList or similar; adjust based on actual OKX API response structure
-        // For now, use a placeholder matching log example
+        if (!d || !d.toTokenAmount || !d.tx || !d.tx.to || !d.tx.data) throw new Error("Incomplete OKX data");
         const subRoutes = [
             [{ name: "DODO V2", percent: "100", logo: "https://static.okx.com/cdn/web3/dex/logo/dodo_v2.png" }],
             [{ name: "LitePSM", percent: "100" }],
@@ -350,7 +349,7 @@ app.get('/swap/v1/quote/events', async (req, res) => {
     res.end();
 });
 app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
-    const { quoteResultCtx, userAddress } = req.body;
+    const { quoteResultCtx, userAddress, fromTokenInfo, toTokenInfo } = req.body;
    
     // Safety check
     if (!quoteResultCtx) return res.json(ok(null));
@@ -361,7 +360,10 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
         return res.json(ok({
             result: {
                 info: { provider: quoteResultCtx.providerId, providerName: quoteResultCtx.providerId.replace('Swap', ''), providerLogo: "https://uni.onekey-asset.com/static/logo/placeholder.png" },
+                fromTokenInfo: fromTokenInfo || {},
+                toTokenInfo: toTokenInfo || {},
                 protocol: 'Swap',
+                kind: 'sell',
                 fee: { percentageFee: FEE_PERCENT * 100 },
                 gasLimit: 21000,
                 routesData: [],
@@ -396,7 +398,10 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
         const response = {
             result: {
                 info: { provider: quoteResultCtx.providerId, providerName: quoteResultCtx.providerId.replace('Swap', ''), providerLogo: "https://uni.onekey-asset.com/static/logo/placeholder.png" },
+                fromTokenInfo: fromTokenInfo || {},
+                toTokenInfo: toTokenInfo || {},
                 protocol: 'Swap',
+                kind: 'sell',
                 fee,
                 gasLimit: Number(quoteResultCtx.tx.gasLimit || 500000),
                 routesData: quoteResultCtx.routesData || [],
