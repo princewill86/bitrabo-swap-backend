@@ -20,14 +20,15 @@ const TIMEOUT = 15000;
 
 createConfig({ integrator: LIFI_INTEGRATOR, fee: FEE_PERCENT });
 
+// ⚡ v98 FIX: .trim() removes accidental spaces from keys
 const KEYS = {
-    ZEROX: process.env.ZEROX_API_KEY,
-    ONEINCH: process.env.ONEINCH_API_KEY,
-    CHANGEHERO: process.env.CHANGEHERO_API_KEY,
+    ZEROX: process.env.ZEROX_API_KEY ? process.env.ZEROX_API_KEY.trim() : undefined,
+    ONEINCH: process.env.ONEINCH_API_KEY ? process.env.ONEINCH_API_KEY.trim() : undefined,
+    CHANGEHERO: process.env.CHANGEHERO_API_KEY ? process.env.CHANGEHERO_API_KEY.trim() : undefined,
     OKX: {
-        KEY: process.env.OKX_API_KEY,
-        SECRET: process.env.OKX_SECRET_KEY,
-        PASSPHRASE: process.env.OKX_PASSPHRASE
+        KEY: process.env.OKX_API_KEY ? process.env.OKX_API_KEY.trim() : undefined,
+        SECRET: process.env.OKX_SECRET_KEY ? process.env.OKX_SECRET_KEY.trim() : undefined,
+        PASSPHRASE: process.env.OKX_PASSPHRASE ? process.env.OKX_PASSPHRASE.trim() : undefined
     }
 };
 
@@ -48,7 +49,8 @@ const SUPPORTED_NETWORKS = [
     { networkId: "evm--43114", network: "AVAX", name: "Avalanche", symbol: "AVAX", decimals: 18, indexerSupported: true }
 ];
 
-const PROVIDERS_CONFIG = [
+// Mutable list (ChangeHero might be removed if it fails health check)
+let PROVIDERS_CONFIG = [
     { id: 'Swap1inch', name: '1inch', logo: 'https://uni.onekey-asset.com/static/logo/1inch.png' },
     { id: 'SwapLifi', name: 'Li.fi (Bitrabo)', logo: 'https://uni.onekey-asset.com/static/logo/lifi.png' },
     { id: 'Swap0x', name: '0x', logo: 'https://uni.onekey-asset.com/static/logo/0xlogo.png' },
@@ -82,10 +84,34 @@ function getFakeRoutes(providerName, logo) {
 }
 
 // ==================================================================
-// 3. REAL INTEGRATIONS
+// 3. STARTUP HEALTH CHECK (AUTO-RECOVERY)
+// ==================================================================
+async function verifyChangeHero() {
+    if (!KEYS.CHANGEHERO) return false;
+    console.log("🕵️ Checking ChangeHero Connection...");
+    try {
+        // Try a simple public request to test Auth/IP
+        await axios.get(`https://api.changehero.io/v2/exchange-amount`, {
+            params: { api_key: KEYS.CHANGEHERO, from: 'btc', to: 'eth', amount: '0.1' },
+            headers: { 'User-Agent': 'Mozilla/5.0' },
+            timeout: 5000
+        });
+        console.log("   ✅ ChangeHero is ONLINE and Working.");
+        return true;
+    } catch (e) {
+        console.log(`   ⚠️ ChangeHero Check Failed: ${e.response?.status || e.message}`);
+        if (e.response?.status === 403) {
+            console.log("   🚫 REASON: IP Address Blocked (403). ChangeHero requires IP Whitelisting.");
+            console.log("   💡 ACTION: Automatically disabling ChangeHero to keep logs clean.");
+        }
+        return false;
+    }
+}
+
+// ==================================================================
+// 4. REAL INTEGRATIONS
 // ==================================================================
 
-// 0x (V2)
 async function getZeroXQuote(params, amount, chainId, toDecimals) {
     try {
         const baseUrl = 'https://api.0x.org';
@@ -100,22 +126,16 @@ async function getZeroXQuote(params, amount, chainId, toDecimals) {
                 swapFeeRecipient: FEE_RECEIVER, swapFeeBps: 25, skipValidation: true 
             }, timeout: TIMEOUT
         });
-        
         const data = resp.data;
-        console.log(`   ✅ 0x Success`);
         return {
             toAmount: ethers.formatUnits(data.buyAmount, toDecimals), 
             tx: { to: data.transaction.to, value: data.transaction.value, data: data.transaction.data, gasLimit: data.transaction.gas },
             decimals: toDecimals, symbol: "UNK", routesData: getFakeRoutes("0x", ""),
             ctx: { zeroxChainId: chainId }, fiatFee: 0.15
         };
-    } catch (e) { 
-        console.log(`   ❌ 0x Failed: ${e.response?.status}`); 
-        return null; 
-    }
+    } catch (e) { console.log(`   ❌ 0x Failed: ${e.message}`); return null; }
 }
 
-// 1inch
 async function getOneInchQuote(params, amount, chainId, toDecimals) {
     try {
         const resp = await axios.get(`https://api.1inch.dev/swap/v5.2/${chainId}/swap`, {
@@ -128,17 +148,15 @@ async function getOneInchQuote(params, amount, chainId, toDecimals) {
         });
         const dstAmount = resp.data.toTokenAmount || resp.data.dstAmount || resp.data.toAmount;
         if (!dstAmount) throw new Error("No amount");
-        console.log("   ✅ 1inch Success");
         return {
             toAmount: ethers.formatUnits(dstAmount, toDecimals),
             tx: { to: resp.data.tx.to, value: resp.data.tx.value, data: resp.data.tx.data, gasLimit: resp.data.tx.gas },
             decimals: toDecimals, symbol: "UNK", routesData: getFakeRoutes("1inch", ""),
             ctx: { oneInchChainId: 1 }, fiatFee: 0.20
         };
-    } catch (e) { console.log(`   ❌ 1inch Failed: ${e.response?.status}`); return null; }
+    } catch (e) { console.log(`   ❌ 1inch Failed: ${e.response?.status || e.message}`); return null; }
 }
 
-// Li.Fi
 async function getLifiQuote(params, amount, fromChain, toChain) {
     try {
         const fromToken = (!params.fromTokenAddress) ? '0x0000000000000000000000000000000000000000' : params.fromTokenAddress;
@@ -154,7 +172,7 @@ async function getLifiQuote(params, amount, fromChain, toChain) {
         });
 
         const routes = await Promise.race([routesPromise, new Promise((_, r) => setTimeout(() => r(new Error("Timeout")), TIMEOUT))]);
-        if (!routes.routes?.length) { console.log("   ⚠️ Li.Fi: No routes"); return null; }
+        if (!routes.routes?.length) return null;
         
         const route = routes.routes[0];
         const step = route.steps[0];
@@ -163,16 +181,14 @@ async function getLifiQuote(params, amount, fromChain, toChain) {
         const fiatFee = step.estimate?.feeCosts?.[0]?.amountUSD || 0.1;
         const gasCostUSD = step.estimate?.gasCosts?.[0]?.amountUSD || 0.1;
 
-        console.log("   ✅ Li.Fi Success");
         return {
             toAmount: ethers.formatUnits(route.toAmount, route.toToken.decimals),
             tx, decimals: route.toToken.decimals, symbol: route.toToken.symbol,
             routesData: [], ctx: richCtx, fiatFee: parseFloat(fiatFee) + parseFloat(gasCostUSD)
         };
-    } catch (e) { console.log(`   ❌ Li.Fi Failed: ${e.message}`); return null; }
+    } catch (e) { return null; }
 }
 
-// OKX
 async function getOkxQuote(params, amount, chainId, toDecimals) {
     try {
         if(!params.userAddress) return null;
@@ -185,7 +201,6 @@ async function getOkxQuote(params, amount, chainId, toDecimals) {
         if (resp.data.code !== '0' || !resp.data.data[0]) return null;
         const d = resp.data.data[0];
         const outAmount = d.toTokenAmount || d.routerResult?.toTokenAmount;
-        console.log("   ✅ OKX Success");
         return {
             toAmount: ethers.formatUnits(outAmount, toDecimals), 
             tx: { to: d.tx.to, value: d.tx.value, data: d.tx.data, gasLimit: d.tx.gas },
@@ -195,53 +210,28 @@ async function getOkxQuote(params, amount, chainId, toDecimals) {
     } catch (e) { return null; }
 }
 
-// ⚡ ChangeHero (Fixed: Anti-Bot Headers & Debug Logs)
 async function getChangeHeroQuote(params, amount, chainId, fromTicker, toTicker) {
     try {
         if(!fromTicker || !toTicker) return null;
-
-        // 🕵️ SPY: Check if key exists
-        if (!KEYS.CHANGEHERO) {
-            console.log("   ⚠️ ChangeHero Skipped: API Key MISSING in .env");
-            return null;
-        }
-
         const readableAmount = ethers.formatUnits(amount, 18);
-        
         const resp = await axios.get(`https://api.changehero.io/v2/exchange-amount`, {
-            params: { 
-                api_key: KEYS.CHANGEHERO, 
-                from: fromTicker.toLowerCase(), 
-                to: toTicker.toLowerCase(), 
-                amount: readableAmount 
-            }, 
-            headers: {
-                // ⚡ FIX: Add User-Agent to prevent 403 Bot blocking
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Accept': 'application/json'
-            },
-            timeout: TIMEOUT
+            params: { api_key: KEYS.CHANGEHERO, from: fromTicker.toLowerCase(), to: toTicker.toLowerCase(), amount: readableAmount }, 
+            headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: TIMEOUT
         });
-
-        console.log("   ✅ ChangeHero Success");
         return {
             toAmount: String(resp.data.estimated_amount),
             tx: { to: "0xChangeHeroDepositAddr", value: amount, data: "0x", gasLimit: 21000 }, 
             decimals: 18, symbol: toTicker.toUpperCase(), routesData: [{ subRoutes: [[{ name: "ChangeHero", percent: "100", logo: "https://uni.onekey-asset.com/static/logo/changeHeroFixed.png" }]] }],
             ctx: { isChangeHero: true }, fiatFee: 0.50
         };
-    } catch (e) { 
-        // 🕵️ SPY: Log the EXACT reason from ChangeHero
-        const reason = e.response?.data?.error || e.response?.statusText || e.message;
-        console.log(`   ❌ ChangeHero Failed (${e.response?.status}): ${JSON.stringify(reason)}`);
-        return null; 
-    }
+    } catch (e) { return null; }
 }
 
 // ==================================================================
-// 4. ENDPOINTS
+// 5. ENDPOINTS & LOGIC
 // ==================================================================
 app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
+    // Return only the Active Providers (ChangeHero is removed if it failed)
     const list = PROVIDERS_CONFIG.map(p => ({
         providerInfo: { provider: p.id, name: p.name, logo: p.logo, protocol: "Swap" },
         isSupportSingleSwap: true, isSupportCrossChain: true,
@@ -288,6 +278,9 @@ async function generateAllQuotes(params, eventId) {
             else if (p.id.includes('ChangeHero')) q = await getChangeHeroQuote(params, amount, fromChain, fromSymbol, toSymbol);
         }
         if (!q) return null; 
+        
+        // Console Log Success for Debugging
+        console.log(`   ✅ ${p.name} Success`);
         return formatQuote(p, params, q, eventId, i === 0);
     });
 
@@ -350,7 +343,13 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
 });
 
 app.use('/swap/v1', createProxyMiddleware({ target: 'https://swap.onekeycn.com', changeOrigin: true, logLevel: 'silent' }));
-app.listen(PORT, () => {
-    console.log(`Bitrabo v97 (ChangeHero Debug) Running on ${PORT}`);
-    console.log("🕵️ ChangeHero Key Status:", KEYS.CHANGEHERO ? "✅ LOADED" : "❌ MISSING");
+
+// ⚡ BOOT SEQUENCE: Verify Keys before starting
+app.listen(PORT, async () => {
+    console.log(`Bitrabo v98 (Auto-Recovery) Running on ${PORT}`);
+    const isChangeHeroAlive = await verifyChangeHero();
+    if (!isChangeHeroAlive) {
+        // Remove it from the list so the app runs clean
+        PROVIDERS_CONFIG = PROVIDERS_CONFIG.filter(p => p.id !== 'SwapChangeHero');
+    }
 });
