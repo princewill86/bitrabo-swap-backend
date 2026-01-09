@@ -49,7 +49,7 @@ const SUPPORTED_NETWORKS = [
 ];
 
 const PROVIDERS_CONFIG = [
-    { id: 'Swap1inch', name: '1inch', logo: 'https://uni.onekey-asset.com/static/logo/1inch.png' },
+    { id: 'Swap1inch', name: '1inch', logo: 'https://common.onekey-asset.com/logo/1Inch.png' },
     { id: 'SwapLifi', name: 'Li.fi (Bitrabo)', logo: 'https://uni.onekey-asset.com/static/logo/lifi.png' },
     { id: 'Swap0x', name: '0x', logo: 'https://uni.onekey-asset.com/static/logo/0xlogo.png' },
     { id: 'SwapOKX', name: 'OKX Dex', logo: 'https://uni.onekey-asset.com/static/logo/OKXDex.png' },
