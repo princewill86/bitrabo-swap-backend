@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { createProxyMiddleware } = require('http-proxy-middleware');
+const { createProxyMiddleware, responseInterceptor } = require('http-proxy-middleware');
 const BigNumber = require('bignumber.js');
 const { ethers } = require('ethers');
 const { createConfig, getRoutes, getToken, getStepTransaction } = require('@lifi/sdk');
@@ -9,7 +9,7 @@ const { v4: uuidv4 } = require('uuid');
 const axios = require('axios');
 const crypto = require('crypto');
 
-// --- CACHE ---
+// --- CACHE (Internal) ---
 class SimpleCache {
     constructor(ttl) { this.cache = new Map(); this.ttl = ttl * 1000; }
     get(k) { const i = this.cache.get(k); return i && Date.now() < i.e ? i.v : null; }
@@ -27,6 +27,7 @@ const LIFI_INTEGRATOR = process.env.BITRABO_INTEGRATOR || 'bitrabo';
 
 createConfig({ integrator: LIFI_INTEGRATOR, fee: FEE_PERCENT });
 
+// API KEYS
 const KEYS = {
     ZEROX: process.env.ZEROX_API_KEY,
     ONEINCH: process.env.ONEINCH_API_KEY,
@@ -39,35 +40,32 @@ const KEYS = {
 };
 
 app.use(cors({ origin: '*' }));
-const jsonParser = express.json();
+// NOTE: We do NOT use global jsonParser here to avoid breaking the Proxy stream.
+// We only apply it to our specific routes.
+const jsonParser = express.json(); 
 const ok = (data) => ({ code: 0, message: "Success", data });
 
 // ==================================================================
-// 1. HELPERS & MAPPINGS
+// 🕵️ TRAFFIC INSPECTOR (LOGGER)
 // ==================================================================
+app.use((req, res, next) => {
+    // Log every request URL and Query Params
+    const isHijack = req.url.includes('quote') || req.url.includes('providers') || req.url.includes('build-tx');
+    const prefix = isHijack ? '⚡ HIJACK' : '🔄 PROXY';
+    
+    console.log(`\n[${prefix}] ${req.method} ${req.path}`);
+    if (Object.keys(req.query).length > 0) {
+        console.log(`   ❓ Params: ${JSON.stringify(req.query)}`);
+    }
+    next();
+});
 
-// Map addresses to Symbols for ChangeHero
-const TOKEN_MAP = {
-    '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee': 'ETH',
-    '0x0000000000000000000000000000000000000000': 'ETH',
-    '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2': 'ETH', // WETH
-    '0xdac17f958d2ee523a2206206994597c13d831ec7': 'USDT',
-    '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48': 'USDC',
-    '0x6b175474e89094c44da98b954eedeac495271d0f': 'DAI',
-    '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599': 'BTC', // WBTC
-    '0x55d398326f99059ff775485246999027b3197955': 'USDT', // BSC
-    '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': 'USDC', // BSC
-};
-
-function getSymbol(address) {
-    if (!address) return 'ETH';
-    return TOKEN_MAP[address.toLowerCase()] || null;
-}
-
-// 0x Chain Mapper
+// ==================================================================
+// 1. HELPERS
+// ==================================================================
 function getZeroXBaseUrl(chainId) {
     switch (chainId) {
-        case 1: return 'https://api.0x.org'; // Mainnet often works on root, or ethereum.api.0x.org
+        case 1: return 'https://api.0x.org'; 
         case 56: return 'https://bsc.api.0x.org';
         case 137: return 'https://polygon.api.0x.org';
         case 10: return 'https://optimism.api.0x.org';
@@ -78,7 +76,7 @@ function getZeroXBaseUrl(chainId) {
 }
 
 // ==================================================================
-// 2. REAL INTEGRATIONS
+// 2. REAL INTEGRATIONS (Your Keys)
 // ==================================================================
 
 // LI.FI
@@ -86,24 +84,23 @@ async function getLifiQuote(params, amount, chainId) {
     const fromToken = params.fromTokenAddress || '0x0000000000000000000000000000000000000000';
     const toToken = params.toTokenAddress || '0x0000000000000000000000000000000000000000';
     
+    // Fallback address for quoting only (avoids validation errors)
+    const fromAddr = params.userAddress || "0x5555555555555555555555555555555555555555"; 
+
     const routes = await getRoutes({
         fromChainId: chainId, toChainId: chainId,
         fromTokenAddress: fromToken, toTokenAddress: toToken,
-        fromAmount: amount, 
-        // Use user address if valid, otherwise don't pass it for the QUOTE step (prevents validation errors)
-        fromAddress: params.userAddress || "0x5555555555555555555555555555555555555555", 
+        fromAmount: amount, fromAddress: fromAddr, 
         options: { integrator: LIFI_INTEGRATOR, fee: FEE_PERCENT, referrer: FEE_RECEIVER }
     });
 
-    if (!routes.routes?.length) throw new Error("No Routes Found");
+    if (!routes.routes?.length) throw new Error("No Routes");
     const step = routes.routes[0].steps[0];
     const tx = await getStepTransaction(step);
     
     return {
         toAmount: ethers.formatUnits(routes.routes[0].toAmount, routes.routes[0].toToken.decimals),
-        tx, 
-        decimals: routes.routes[0].toToken.decimals, 
-        symbol: routes.routes[0].toToken.symbol
+        tx, decimals: routes.routes[0].toToken.decimals, symbol: routes.routes[0].toToken.symbol
     };
 }
 
@@ -114,20 +111,17 @@ async function getZeroXQuote(params, amount, chainId) {
         headers: { '0x-api-key': KEYS.ZEROX },
         params: {
             sellToken: params.fromTokenAddress || 'ETH',
-            buyToken: params.toTokenAddress, // 0x needs address, not 'ETH' usually, but 'ETH' works for sellToken
+            buyToken: params.toTokenAddress,
             sellAmount: amount,
-            takerAddress: params.userAddress, // Optional for quote, required for swap
+            takerAddress: params.userAddress, 
             feeRecipient: FEE_RECEIVER, 
             buyTokenPercentageFee: FEE_PERCENT
         }
     });
-    
-    // Normalize response
     return {
-        toAmount: ethers.formatUnits(resp.data.buyAmount, 18), // We guess 18 if we don't know
+        toAmount: ethers.formatUnits(resp.data.buyAmount, 18), // Default 18 if unknown
         tx: {
-            to: resp.data.to, value: resp.data.value, data: resp.data.data,
-            gasLimit: resp.data.gas
+            to: resp.data.to, value: resp.data.value, data: resp.data.data, gasLimit: resp.data.gas
         },
         decimals: 18, symbol: "UNK"
     };
@@ -147,8 +141,7 @@ async function getOneInchQuote(params, amount, chainId) {
     return {
         toAmount: ethers.formatUnits(resp.data.dstAmount, 18),
         tx: {
-            to: resp.data.tx.to, value: resp.data.tx.value, data: resp.data.tx.data,
-            gasLimit: resp.data.tx.gas
+            to: resp.data.tx.to, value: resp.data.tx.value, data: resp.data.tx.data, gasLimit: resp.data.tx.gas
         },
         decimals: 18, symbol: "UNK"
     };
@@ -156,33 +149,28 @@ async function getOneInchQuote(params, amount, chainId) {
 
 // CHANGEHERO
 async function getChangeHeroQuote(params, amount, chainId) {
-    const fromSym = getSymbol(params.fromTokenAddress);
-    const toSym = getSymbol(params.toTokenAddress);
+    // Basic mapping for demo - Expand this list for production!
+    const map = { 
+        '0xdac17f958d2ee523a2206206994597c13d831ec7': 'usdt',
+        '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48': 'usdc',
+        '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee': 'eth'
+    };
     
-    if (!fromSym || !toSym) throw new Error(`Symbol mapping not found for ${params.fromTokenAddress} -> ${params.toTokenAddress}`);
+    const fromSym = map[params.fromTokenAddress?.toLowerCase()] || (params.fromTokenAddress ? null : 'eth');
+    const toSym = map[params.toTokenAddress?.toLowerCase()];
 
-    // ChangeHero needs human readable amount (e.g., "1.5" not "1500000...")
-    // We roughly estimate decimals here (default 18)
+    if (!fromSym || !toSym) throw new Error("Ticker Mapping Missing");
+
     const readableAmount = ethers.formatUnits(amount, 18); 
-
     const url = `https://api.changehero.io/v2/exchange-amount`;
     const resp = await axios.get(url, {
-        params: {
-            api_key: KEYS.CHANGEHERO,
-            from: fromSym.toLowerCase(),
-            to: toSym.toLowerCase(),
-            amount: readableAmount
-        }
+        params: { api_key: KEYS.CHANGEHERO, from: fromSym, to: toSym, amount: readableAmount }
     });
 
-    // ChangeHero returns 'estimated_amount'. 
-    // NOTE: This does NOT give us a tx data blob. We'd need to create a deposit tx manually.
-    // For now, we will return the RATE but Mock the TX so the button works (swap won't execute on-chain directly via ChangeHero logic yet).
-    
     return {
         toAmount: resp.data.estimated_amount,
-        tx: null, // ChangeHero is CEX-style, logic is different. We keep it as "Rate Only" for now.
-        decimals: 18, symbol: toSym
+        tx: null, // ChangeHero needs special handling
+        decimals: 18, symbol: toSym.toUpperCase()
     };
 }
 
@@ -200,11 +188,7 @@ async function getOkxQuote(params, amount, chainId) {
                 'X-Simulated-Trading': '0'
             }
         });
-        
-        if (resp.data.code !== '0') {
-            throw new Error(`OKX API Error: ${resp.data.msg}`);
-        }
-
+        if (resp.data.code !== '0') throw new Error(`OKX: ${resp.data.msg}`);
         const d = resp.data.data[0];
         return {
             toAmount: ethers.formatUnits(d.toTokenAmount, 18), 
@@ -232,7 +216,6 @@ app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => res.json(o
 app.get(['/swap/v1/check-support', '/check-support'], (req, res) => res.json(ok([{ status: 'available', networkId: req.query.networkId }])));
 app.get(['/swap/v1/allowance', '/allowance'], (req, res) => res.json(ok("0"))); 
 
-// AGGREGATOR
 async function generateAllQuotes(params, eventId) {
     const chainId = parseInt(params.fromNetworkId.replace('evm--', ''));
     let amount = params.fromTokenAmount;
@@ -245,12 +228,11 @@ async function generateAllQuotes(params, eventId) {
         amount = ethers.parseUnits(Number(amount).toFixed(18), 18).toString();
     }
 
-    console.log(`[🔍 AGGREGATOR] Fetching Real Quotes for ${amount}...`);
+    console.log(`[🔍 AGGREGATOR] Fetching for ${amount}...`);
 
     const promises = MY_PROVIDERS.map(async (p, i) => {
         try {
             let q = null;
-            
             if (p.name.includes('Li.fi')) q = await getLifiQuote(params, amount, chainId);
             else if (p.name.includes('1inch')) q = await getOneInchQuote(params, amount, chainId);
             else if (p.name.includes('0x')) q = await getZeroXQuote(params, amount, chainId);
@@ -258,10 +240,9 @@ async function generateAllQuotes(params, eventId) {
             else if (p.name.includes('ChangeHero')) q = await getChangeHeroQuote(params, amount, chainId);
             else if (p.name.includes('Jupiter')) {
                 if(!params.fromNetworkId.includes('sol')) throw new Error("Not Solana");
-                // ... Jupiter logic ...
             }
             
-            // Format Real Quote
+            // Real Data Success
             return formatQuote(p, params, q, eventId, i === 0);
 
         } catch (e) {
@@ -275,7 +256,6 @@ async function generateAllQuotes(params, eventId) {
 
 // FORMATTERS
 function formatQuote(provider, params, data, eventId, isBest) {
-    if (!data) throw new Error("No Data");
     const rate = new BigNumber(data.toAmount).div(params.fromTokenAmount).toFixed();
     return {
         info: { provider: provider.provider, providerName: provider.name, providerLogo: provider.logoURI },
@@ -312,7 +292,10 @@ function getMockQuote(provider, params, eventId, isBest) {
     };
 }
 
-// ROUTES
+// ==================================================================
+// 4. ROUTES & CATCH-ALL SPY PROXY
+// ==================================================================
+
 app.get('/swap/v1/quote/events', async (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     const eventId = uuidv4();
@@ -328,15 +311,19 @@ app.get('/swap/v1/quote/events', async (req, res) => {
 
 app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
     const { quoteResultCtx, userAddress } = req.body;
+    
+    // Log the Build Request
+    console.log(`[⚙️ BUILD-TX REQUEST] Provider: ${quoteResultCtx?.providerId} | User: ${userAddress}`);
+
     if (quoteResultCtx?.isMock) {
-        console.log(`[⚙️ MOCK-TX] for ${quoteResultCtx.providerId}`);
+        console.log(`   ⚠️ Sending MOCK Transaction (No Fee)`);
         return res.json(ok({
             result: { info: { provider: quoteResultCtx.providerId }, protocol: 'Swap', fee: { percentageFee: 0.25 }, gasLimit: 21000 },
             tx: { to: userAddress, value: "0", data: "0x" }
         }));
     }
     if (quoteResultCtx?.tx) {
-        console.log(`[⚙️ REAL-TX] for ${quoteResultCtx.providerId}`);
+        console.log(`   ✅ Sending REAL Transaction (Fee Included)`);
         return res.json(ok({
             result: { info: { provider: quoteResultCtx.providerId }, protocol: 'Swap', fee: { percentageFee: FEE_PERCENT * 100 }, gasLimit: Number(quoteResultCtx.tx.gasLimit || 500000) },
             tx: { ...quoteResultCtx.tx, from: userAddress, value: new BigNumber(quoteResultCtx.tx.value).toFixed() }
@@ -345,5 +332,27 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
     res.json(ok(null));
 });
 
-app.use('/swap/v1', createProxyMiddleware({ target: 'https://swap.onekeycn.com', changeOrigin: true, logLevel: 'silent' }));
-app.listen(PORT, () => console.log(`Bitrabo v71 Running on ${PORT}`));
+// SPY PROXY (Catch-All)
+// This proxies everything we didn't handle to OneKey and LOGS the output
+app.use('/swap/v1', createProxyMiddleware({
+    target: 'https://swap.onekeycn.com',
+    changeOrigin: true,
+    selfHandleResponse: true, // Allow us to read body
+    onProxyReq: (proxyReq) => {
+        // Disable compression so we can read the text response
+        proxyReq.setHeader('accept-encoding', 'identity'); 
+    },
+    onProxyRes: responseInterceptor(async (responseBuffer, proxyRes, req, res) => {
+        const responseStr = responseBuffer.toString('utf8');
+        try {
+            // Log OneKey's Real Response for debugging
+            if (req.url.includes('quote') || req.url.includes('allowance')) {
+                console.log(`\n[🕵️ ONEKEY SPY] Response from ${req.url}:`);
+                console.log(responseStr.substring(0, 500)); // Log first 500 chars to avoid spam
+            }
+        } catch (e) {}
+        return responseStr;
+    })
+}));
+
+app.listen(PORT, () => console.log(`Bitrabo v72 Running on ${PORT}`));
