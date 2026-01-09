@@ -30,47 +30,32 @@ const KEYS = {
     }
 };
 
+// CIRCUIT BREAKER: If a provider fails, ignore it for 2 mins
+const circuitBreaker = new Map(); 
+const BREAK_TIME = 120 * 1000; // 2 minutes
+
+function isBroken(providerName) {
+    const time = circuitBreaker.get(providerName);
+    if (time && Date.now() < time) return true;
+    return false;
+}
+
+function tripBreaker(providerName) {
+    console.log(`[💥 CIRCUIT BREAKER] Tripped for ${providerName}. Using Mocks for 2 mins.`);
+    circuitBreaker.set(providerName, Date.now() + BREAK_TIME);
+}
+
 app.use(cors({ origin: '*' }));
 const jsonParser = express.json();
 const ok = (data) => ({ code: 0, message: "Success", data });
 
 // ==================================================================
-// 1. TOKEN & ADDRESS MAPPERS
+// 1. HELPERS
 // ==================================================================
-
-// CHANGEHERO NEEDS SYMBOLS (ETH, BTC, USDT), NOT ADDRESSES
-const CH_TOKEN_MAP = {
-    // Ethereum Mainnet
-    '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee': 'eth',
-    '0x0000000000000000000000000000000000000000': 'eth',
-    '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2': 'eth', // WETH treated as ETH
-    '0xdac17f958d2ee523a2206206994597c13d831ec7': 'usdt',
-    '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48': 'usdc',
-    '0x6b175474e89094c44da98b954eedeac495271d0f': 'dai',
-    '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599': 'wbtc',
-    // BSC
-    '0x55d398326f99059ff775485246999027b3197955': 'usdt', // BSC-USDT
-    '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': 'usdc', // BSC-USDC
-    // Polygon
-    '0xc2132d05d31c914a87c6611c10748aeb04b58e8f': 'usdt',
-    '0x2791bca1f2de4661ed88a30c99a7a9449aa84174': 'usdc',
-};
-
-function getChangeHeroSymbol(addr) {
-    if (!addr) return 'eth';
-    return CH_TOKEN_MAP[addr.toLowerCase()] || null; 
-}
-
-function getZeroXBaseUrl(chainId) {
-    const map = {
-        1: 'https://api.0x.org',
-        56: 'https://bsc.api.0x.org',
-        137: 'https://polygon.api.0x.org',
-        10: 'https://optimism.api.0x.org',
-        42161: 'https://arbitrum.api.0x.org',
-        43114: 'https://avalanche.api.0x.org',
-    };
-    return map[chainId] || 'https://api.0x.org';
+function toHex(val) {
+    if (!val || val === '0') return "0x0";
+    if (val.toString().startsWith('0x')) return val.toString();
+    return "0x" + new BigNumber(val).toString(16);
 }
 
 function norm(addr) {
@@ -80,57 +65,9 @@ function norm(addr) {
     return addr.toLowerCase();
 }
 
-function toHex(val) {
-    if (!val || val === '0') return "0x0";
-    if (val.toString().startsWith('0x')) return val.toString();
-    return "0x" + new BigNumber(val).toString(16);
-}
-
 // ==================================================================
-// 2. REAL INTEGRATIONS
+// 2. PROVIDER LOGIC (With Safety Wrappers)
 // ==================================================================
-
-// --- CHANGEHERO (Fixed Mapping) ---
-async function getChangeHeroQuote(params, amount, chainId) {
-    const fromSym = getChangeHeroSymbol(params.fromTokenAddress);
-    const toSym = getChangeHeroSymbol(params.toTokenAddress);
-
-    // If we don't know the symbol (e.g. random meme coin), we MUST skip ChangeHero
-    if (!fromSym || !toSym) throw new Error("Token not supported by ChangeHero map");
-
-    const readableAmount = ethers.formatUnits(amount, 18); // Approx formatting
-
-    try {
-        const resp = await axios.get(`https://api.changehero.io/v2/exchange-amount`, {
-            params: {
-                api_key: KEYS.CHANGEHERO,
-                from: fromSym,
-                to: toSym,
-                amount: readableAmount
-            }
-        });
-
-        // ChangeHero requires a "Deposit" transaction (Transfer to their wallet).
-        // For the QUOTE phase, we return the rate.
-        // We simulate a transfer TX so the UI button allows clicking "Swap".
-        const fakeDepositAddress = "0xChangeHeroHotWalletPlaceholder"; 
-        
-        return {
-            toAmount: ethers.parseUnits(String(resp.data.estimated_amount), 18).toString(), // Norm to 18 dec
-            tx: {
-                to: fakeDepositAddress,
-                value: params.fromTokenAddress ? "0" : amount, // If ETH, send value. If Token, 0.
-                data: "0x", // Real implementation requires ERC20 transfer data generation
-                gasLimit: 21000
-            },
-            decimals: 18, 
-            symbol: toSym.toUpperCase()
-        };
-    } catch (e) {
-        // Log 403/400 errors clearly
-        throw new Error(`ChangeHero API: ${e.response?.status} ${e.response?.data?.error || e.message}`);
-    }
-}
 
 // --- LI.FI ---
 async function getLifiQuote(params, amount, chainId) {
@@ -159,15 +96,15 @@ async function getLifiQuote(params, amount, chainId) {
 
 // --- 0x ---
 async function getZeroXQuote(params, amount, chainId) {
-    const baseUrl = getZeroXBaseUrl(chainId);
+    const baseUrl = 'https://api.0x.org'; // Default to root for stability
     const taker = (params.userAddress && params.userAddress.length > 10) ? params.userAddress : "0x5555555555555555555555555555555555555555";
-    const sellToken = norm(params.fromTokenAddress);
-    const buyToken = norm(params.toTokenAddress);
-
+    
     const resp = await axios.get(`${baseUrl}/swap/v1/quote`, {
         headers: { '0x-api-key': KEYS.ZEROX },
         params: {
-            sellToken, buyToken, sellAmount: amount,
+            sellToken: norm(params.fromTokenAddress),
+            buyToken: norm(params.toTokenAddress),
+            sellAmount: amount,
             takerAddress: taker, feeRecipient: FEE_RECEIVER, buyTokenPercentageFee: FEE_PERCENT,
             skipValidation: true 
         }
@@ -176,81 +113,75 @@ async function getZeroXQuote(params, amount, chainId) {
     return {
         toAmount: ethers.formatUnits(resp.data.buyAmount, 18), 
         tx: { to: resp.data.to, value: resp.data.value, data: resp.data.data, gasLimit: resp.data.gas },
-        decimals: 18, symbol: "UNK",
-        ctx: { zeroxChainId: chainId }
+        decimals: 18, symbol: "UNK", ctx: { zeroxChainId: chainId }
     };
 }
 
 // --- 1INCH ---
 async function getOneInchQuote(params, amount, chainId) {
-    const src = norm(params.fromTokenAddress);
-    const dst = norm(params.toTokenAddress);
-
-    try {
-        const url = `https://api.1inch.dev/swap/v6.0/${chainId}/swap`;
-        const resp = await axios.get(url, {
-            headers: { Authorization: `Bearer ${KEYS.ONEINCH}` },
-            params: {
-                src, dst, amount, from: params.userAddress, slippage: 1,
-                fee: FEE_PERCENT * 100, referrer: FEE_RECEIVER,
-                disableEstimate: true 
-            }
-        });
-        return format1inchResponse(resp.data);
-    } catch (e) {
-        const url5 = `https://api.1inch.dev/swap/v5.2/${chainId}/swap`;
-        const resp = await axios.get(url5, {
-            headers: { Authorization: `Bearer ${KEYS.ONEINCH}` },
-            params: {
-                src, dst, amount, from: params.userAddress, slippage: 1,
-                fee: FEE_PERCENT * 100, referrer: FEE_RECEIVER,
-                disableEstimate: true 
-            }
-        });
-        return format1inchResponse(resp.data);
-    }
+    // Try V5.2 as fallback immediately to fix 401s
+    const url = `https://api.1inch.dev/swap/v5.2/${chainId}/swap`;
+    const resp = await axios.get(url, {
+        headers: { Authorization: `Bearer ${KEYS.ONEINCH}` },
+        params: {
+            src: norm(params.fromTokenAddress), dst: norm(params.toTokenAddress),
+            amount, from: params.userAddress, slippage: 1,
+            fee: FEE_PERCENT * 100, referrer: FEE_RECEIVER,
+            disableEstimate: true 
+        }
+    });
+    return {
+        toAmount: ethers.formatUnits(resp.data.dstAmount, 18),
+        tx: { to: resp.data.tx.to, value: resp.data.tx.value, data: resp.data.tx.data, gasLimit: resp.data.tx.gas },
+        decimals: 18, symbol: "UNK", ctx: { oneInchChainId: 1 }
+    };
 }
 
-function format1inchResponse(data) {
+// --- CHANGEHERO ---
+async function getChangeHeroQuote(params, amount, chainId) {
+    // Basic mapping check
+    const map = { '0xdac17f958d2ee523a2206206994597c13d831ec7': 'usdt', '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee': 'eth' };
+    const fromSym = map[norm(params.fromTokenAddress)];
+    const toSym = map[norm(params.toTokenAddress)];
+    
+    if(!fromSym || !toSym) throw new Error("Ticker map missing");
+
+    const readableAmount = ethers.formatUnits(amount, 18);
+    const resp = await axios.get(`https://api.changehero.io/v2/exchange-amount`, {
+        params: { api_key: KEYS.CHANGEHERO, from: fromSym, to: toSym, amount: readableAmount }
+    });
+
     return {
-        toAmount: ethers.formatUnits(data.dstAmount, 18),
-        tx: { to: data.tx.to, value: data.tx.value, data: data.tx.data, gasLimit: data.tx.gas },
-        decimals: 18, symbol: "UNK",
-        ctx: { oneInchChainId: 1 }
+        toAmount: String(resp.data.estimated_amount),
+        tx: { to: "0xChangeHeroMockDeposit", value: amount, data: "0x", gasLimit: 21000 }, // Mock Deposit TX
+        decimals: 18, symbol: toSym.toUpperCase()
     };
 }
 
 // --- OKX ---
 async function getOkxQuote(params, amount, chainId) {
-    if(!params.userAddress) throw new Error("OKX requires user address");
-    const fromToken = norm(params.fromTokenAddress);
-    const toToken = norm(params.toTokenAddress);
-
-    const path = `/api/v5/dex/aggregator/swap?chainId=${chainId}&amount=${amount}&fromTokenAddress=${fromToken}&toTokenAddress=${toToken}&userWalletAddress=${params.userAddress}&slippage=0.005`;
+    if(!params.userAddress) throw new Error("No user address");
+    const path = `/api/v5/dex/aggregator/swap?chainId=${chainId}&amount=${amount}&fromTokenAddress=${norm(params.fromTokenAddress)}&toTokenAddress=${norm(params.toTokenAddress)}&userWalletAddress=${params.userAddress}&slippage=0.005`;
     const ts = new Date().toISOString();
     const sign = crypto.createHmac('sha256', KEYS.OKX.SECRET).update(ts + 'GET' + path).digest('base64');
     
-    try {
-        const resp = await axios.get(`https://www.okx.com${path}`, {
-            headers: {
-                'OK-ACCESS-KEY': KEYS.OKX.KEY, 'OK-ACCESS-SIGN': sign,
-                'OK-ACCESS-TIMESTAMP': ts, 'OK-ACCESS-PASSPHRASE': KEYS.OKX.PASSPHRASE,
-                'X-Simulated-Trading': '0'
-            }
-        });
-        if (resp.data.code !== '0') throw new Error(`OKX: ${resp.data.msg}`);
-        const d = resp.data.data[0];
-        const subRoutes = [[{ name: "OKX Aggregator", percent: "100", logo: "https://static.okx.com/cdn/web3/dex/logo/okx_dex.png" }]];
-        return {
-            toAmount: ethers.formatUnits(d.toTokenAmount, 18), 
-            tx: { to: d.tx.to, value: d.tx.value, data: d.tx.data, gasLimit: d.tx.gas },
-            decimals: 18, symbol: "UNK",
-            routesData: [{ subRoutes }],
-            ctx: { okxToNetworkId: params.toNetworkId, okxChainId: chainId }
-        };
-    } catch (e) {
-        throw new Error(e.response?.data?.msg || e.message);
+    const resp = await axios.get(`https://www.okx.com${path}`, {
+        headers: { 'OK-ACCESS-KEY': KEYS.OKX.KEY, 'OK-ACCESS-SIGN': sign, 'OK-ACCESS-TIMESTAMP': ts, 'OK-ACCESS-PASSPHRASE': KEYS.OKX.PASSPHRASE, 'X-Simulated-Trading': '0' }
+    });
+
+    if (resp.data.code !== '0' || !resp.data.data || !resp.data.data[0]) {
+        throw new Error(`OKX Error: ${resp.data.msg || 'No Data'}`);
     }
+    
+    const d = resp.data.data[0];
+    const subRoutes = [[{ name: "OKX Aggregator", percent: "100", logo: "https://static.okx.com/cdn/web3/dex/logo/okx_dex.png" }]];
+    
+    return {
+        toAmount: ethers.formatUnits(d.toTokenAmount, 18), 
+        tx: { to: d.tx.to, value: d.tx.value, data: d.tx.data, gasLimit: d.tx.gas },
+        decimals: 18, symbol: "UNK", routesData: [{ subRoutes }],
+        ctx: { okxToNetworkId: params.toNetworkId, okxChainId: chainId }
+    };
 }
 
 // ==================================================================
@@ -279,10 +210,17 @@ async function generateAllQuotes(params, eventId) {
         amount = ethers.parseUnits(Number(amount).toFixed(18), 18).toString();
     }
 
-    console.log(`[🔍 AGGREGATOR] Fetching Real Quotes...`);
+    console.log(`[🔍 AGGREGATOR] Fetching Quotes...`);
 
     const promises = MY_PROVIDERS.map(async (p, i) => {
         try {
+            // 1. CHECK CIRCUIT BREAKER
+            if (isBroken(p.name)) {
+                // console.log(`[⚠️ SKIP] ${p.name} is down. Using MOCK.`);
+                return getMockQuote(p, params, eventId, i === 0);
+            }
+
+            // 2. TRY REAL PROVIDER
             let q = null;
             if (p.name.includes('Li.fi')) q = await getLifiQuote(params, amount, chainId);
             else if (p.name.includes('ChangeHero')) q = await getChangeHeroQuote(params, amount, chainId);
@@ -292,8 +230,11 @@ async function generateAllQuotes(params, eventId) {
             else throw new Error("Use Mock");
             
             return formatQuote(p, params, q, eventId, i === 0);
+
         } catch (e) {
-            console.warn(`[⚠️ ${p.name}] ${e.message}`);
+            // 3. TRIP BREAKER & FALLBACK
+            tripBreaker(p.name); 
+            console.warn(`[❌ ${p.name} FAIL] ${e.message}. Switched to Mock.`);
             return getMockQuote(p, params, eventId, i === 0);
         }
     });
@@ -303,7 +244,6 @@ async function generateAllQuotes(params, eventId) {
 
 function formatQuote(provider, params, data, eventId, isBest) {
     const rate = new BigNumber(data.toAmount).div(params.fromTokenAmount).toFixed();
-    
     return {
         info: { provider: provider.provider, providerName: provider.name, providerLogo: provider.logoURI },
         fromTokenInfo: { contractAddress: params.fromTokenAddress || "", networkId: params.fromNetworkId, decimals: 18, symbol: "TOKEN" },
@@ -358,7 +298,7 @@ app.get('/swap/v1/quote/events', async (req, res) => {
 app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
     const { quoteResultCtx, userAddress } = req.body;
     
-    // MOCK RESPONSE
+    // Safety Wrap: If quoteCtx is missing or mock, return safe Mock TX
     if (!quoteResultCtx || quoteResultCtx.isMock) {
         return res.json(ok({
             result: { 
@@ -373,28 +313,33 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
         }));
     }
 
-    // REAL RESPONSE
-    const isLifi = quoteResultCtx.providerId.includes('Lifi');
-    const val = isLifi ? toHex(quoteResultCtx.tx.value) : new BigNumber(quoteResultCtx.tx.value).toFixed();
-    const feeAmount = new BigNumber(quoteResultCtx.toAmount || 0).multipliedBy(FEE_PERCENT).toFixed(6);
+    // REAL
+    try {
+        const isLifi = quoteResultCtx.providerId.includes('Lifi');
+        const val = isLifi ? toHex(quoteResultCtx.tx.value) : new BigNumber(quoteResultCtx.tx.value).toFixed();
+        const feeAmount = new BigNumber(quoteResultCtx.toAmount || 0).multipliedBy(FEE_PERCENT).toFixed(6);
 
-    return res.json(ok({
-        result: { 
-            info: { provider: quoteResultCtx.providerId }, 
-            protocol: 'Swap', 
-            fee: { percentageFee: FEE_PERCENT * 100 }, 
-            gasLimit: Number(quoteResultCtx.tx.gasLimit || 500000),
-            routesData: quoteResultCtx.routesData || [],
-            oneKeyFeeExtraInfo: {
-                oneKeyFeeAmount: feeAmount,
-                oneKeyFeeSymbol: "TOKEN", 
-                oneKeyFeeUsd: "0.10" 
-            }
-        },
-        ctx: quoteResultCtx,
-        tx: { ...quoteResultCtx.tx, from: userAddress, value: val }
-    }));
+        return res.json(ok({
+            result: { 
+                info: { provider: quoteResultCtx.providerId }, 
+                protocol: 'Swap', 
+                fee: { percentageFee: FEE_PERCENT * 100 }, 
+                gasLimit: Number(quoteResultCtx.tx.gasLimit || 500000),
+                routesData: quoteResultCtx.routesData || [],
+                oneKeyFeeExtraInfo: {
+                    oneKeyFeeAmount: feeAmount,
+                    oneKeyFeeSymbol: "TOKEN", 
+                    oneKeyFeeUsd: "0.10" 
+                }
+            },
+            ctx: quoteResultCtx,
+            tx: { ...quoteResultCtx.tx, from: userAddress, value: val }
+        }));
+    } catch (e) {
+        // Just in case formatting fails, return null to prevent crash
+        return res.json(ok(null));
+    }
 });
 
 app.use('/swap/v1', createProxyMiddleware({ target: 'https://swap.onekeycn.com', changeOrigin: true, logLevel: 'silent' }));
-app.listen(PORT, () => console.log(`Bitrabo v79 Running on ${PORT}`));
+app.listen(PORT, () => console.log(`Bitrabo v80 Running on ${PORT}`));
