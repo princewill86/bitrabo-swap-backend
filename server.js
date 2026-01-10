@@ -120,7 +120,7 @@ async function getOneInchQuote(params, amount, chainId, toDecimals, nativePriceU
 async function getOkxQuote(params, amount, chainId, toDecimals, nativePriceUSD) {
     try {
         if (!params.userAddress) return null;
-        const path = `/api/v6/dex/aggregator/swap?chainId=${chainId}&amount=${amount}&fromTokenAddress=${norm(params.fromTokenAddress)}&toTokenAddress=${norm(params.toTokenAddress)}&userWalletAddress=${params.userAddress}&slippage=0.005&toTokenReferrerWalletAddress=${FEE_RECEIVER}&feePercent=${(FEE_PERCENT * 100).toFixed(9)}`;
+        const path = `/api/v5/dex/aggregator/swap?chainId=${chainId}&amount=${amount}&fromTokenAddress=${norm(params.fromTokenAddress)}&toTokenAddress=${norm(params.toTokenAddress)}&userWalletAddress=${params.userAddress}&slippage=0.005&referrer=${FEE_RECEIVER}&fee=${FEE_PERCENT}`;
         const ts = new Date().toISOString();
         const sign = crypto.createHmac('sha256', KEYS.OKX.SECRET).update(ts + 'GET' + path).digest('base64');
         const resp = await axios.get(`https://www.okx.com${path}`, {
