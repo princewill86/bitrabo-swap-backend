@@ -8,14 +8,24 @@ const { createConfig, getRoutes, getToken, getStepTransaction } = require('@lifi
 const { v4: uuidv4 } = require('uuid');
 const axios = require('axios');
 const crypto = require('crypto');
+
 const app = express();
 const PORT = process.env.PORT || 10000;
+
 // --- CONFIG ---
 const FEE_RECEIVER = process.env.BITRABO_FEE_RECEIVER;
 const FEE_PERCENT = Number(process.env.BITRABO_FEE || 0.0025);
 const LIFI_INTEGRATOR = process.env.BITRABO_INTEGRATOR || 'bitrabo';
+const LIFI_API_KEY = process.env.LIFI_API_KEY; // ← Critical! Add to .env
 const TIMEOUT = 15000;
-createConfig({ integrator: LIFI_INTEGRATOR, fee: FEE_PERCENT });
+
+// Initialize LiFi with API key if provided
+createConfig({ 
+  integrator: LIFI_INTEGRATOR, 
+  fee: FEE_PERCENT,
+  apiKey: LIFI_API_KEY || undefined  // Will warn in logs if missing
+});
+
 const GAS_PRICE_ESTIMATES = {
     1: "30000000000",
     56: "3000000000",
@@ -25,6 +35,7 @@ const GAS_PRICE_ESTIMATES = {
     8453: "100000000",
     43114: "25000000000"
 };
+
 const KEYS = {
     ZEROX: process.env.ZEROX_API_KEY ? process.env.ZEROX_API_KEY.trim() : undefined,
     ONEINCH: process.env.ONEINCH_API_KEY ? process.env.ONEINCH_API_KEY.trim() : undefined,
@@ -35,9 +46,11 @@ const KEYS = {
         PASSPHRASE: process.env.OKX_PASSPHRASE ? process.env.OKX_PASSPHRASE.trim() : undefined
     }
 };
+
 app.use(cors({ origin: '*' }));
 const jsonParser = express.json();
 const ok = (data) => ({ code: 0, message: "Success", data });
+
 // ==================================================================
 // HELPERS
 // ==================================================================
@@ -48,18 +61,21 @@ function toHex(val) {
         return "0x" + new BigNumber(val).toString(16);
     } catch { return "0x0"; }
 }
+
 function norm(addr) {
     if (!addr || addr === '' || addr === '0x0000000000000000000000000000000000000000') {
         return '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
     }
     return addr.toLowerCase();
 }
+
 function getFakeRoutes(providerName, logo) {
     if (providerName.includes('OKX')) return [{ subRoutes: [[{ name: "PancakeSwap V3", percent: "100", logo: "https://static.okx.com/cdn/web3/dex/logo/pancakeswap_v3.png" }]] }];
     if (providerName.includes('1inch')) return [{ part: 100, subRoutes: [[{ name: "PMM12", part: 100, logo: "https://cdn.1inch.io/liquidity-sources-logo/pmm_color.png" }]] }];
     if (providerName.includes('0x')) return [{ part: 100, subRoutes: [[{ name: "Uniswap V3" }]] }];
     return [{ subRoutes: [[{ name: providerName, percent: "100", logo: logo }]] }];
 }
+
 function calculateFiatFee(gasLimit, gasPrice, nativePriceUSD, chainId) {
     try {
         const priceWei = gasPrice ? new BigNumber(gasPrice) : new BigNumber(GAS_PRICE_ESTIMATES[chainId] || "3000000000");
@@ -72,6 +88,7 @@ function calculateFiatFee(gasLimit, gasPrice, nativePriceUSD, chainId) {
         return 0.15;
     }
 }
+
 // ==================================================================
 // PROVIDER QUOTES
 // ==================================================================
@@ -95,6 +112,7 @@ async function getZeroXQuote(params, amount, chainId, toDecimals, nativePriceUSD
         };
     } catch (e) { console.log(`0x failed: ${e.message}`); return null; }
 }
+
 async function getOneInchQuote(params, amount, chainId, toDecimals, nativePriceUSD) {
     try {
         const resp = await axios.get(`https://api.1inch.dev/swap/v5.2/${chainId}/swap`, {
@@ -117,10 +135,11 @@ async function getOneInchQuote(params, amount, chainId, toDecimals, nativePriceU
         };
     } catch (e) { console.log(`1inch failed: ${e.message}`); return null; }
 }
+
 async function getOkxQuote(params, amount, chainId, toDecimals, nativePriceUSD) {
     try {
         if (!params.userAddress) return null;
-        const path = `/api/v5/dex/aggregator/swap?chainId=${chainId}&amount=${amount}&fromTokenAddress=${norm(params.fromTokenAddress)}&toTokenAddress=${norm(params.toTokenAddress)}&userWalletAddress=${params.userAddress}&slippage=0.005&referrer=${FEE_RECEIVER}&fee=${FEE_PERCENT}`;
+        const path = `/api/v5/dex/aggregator/swap?chainId=${chainId}&amount=${amount}&fromTokenAddress=${norm(params.fromTokenAddress)}&toTokenAddress=${norm(params.toTokenAddress)}&userWalletAddress=${params.userAddress}&slippage=0.005`;
         const ts = new Date().toISOString();
         const sign = crypto.createHmac('sha256', KEYS.OKX.SECRET).update(ts + 'GET' + path).digest('base64');
         const resp = await axios.get(`https://www.okx.com${path}`, {
@@ -144,30 +163,74 @@ async function getOkxQuote(params, amount, chainId, toDecimals, nativePriceUSD) 
         };
     } catch (e) { console.log(`OKX failed: ${e.message}`); return null; }
 }
+
 async function getLifiQuote(params, amount, fromChain, toChain) {
     try {
-        const routes = await getRoutes({
+        const routesPromise = getRoutes({
             fromChainId: fromChain,
             toChainId: toChain,
-            fromTokenAddress: params.fromTokenAddress || '0x0000000000000000000000000000000000000000',
-            toTokenAddress: params.toTokenAddress || '0x0000000000000000000000000000000000000000',
+            fromTokenAddress: params.fromTokenAddress || '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+            toTokenAddress: params.toTokenAddress || '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
             fromAmount: amount,
             fromAddress: params.userAddress || "0x5555555555555555555555555555555555555555",
-            options: { integrator: LIFI_INTEGRATOR, fee: FEE_PERCENT, referrer: FEE_RECEIVER }
+            options: { 
+                integrator: LIFI_INTEGRATOR, 
+                fee: FEE_PERCENT, 
+                referrer: FEE_RECEIVER 
+            }
         });
-        if (!routes.routes?.length) return null;
+
+        const routes = await Promise.race([
+            routesPromise,
+            new Promise((_, reject) => setTimeout(() => reject(new Error("LiFi routes timeout")), TIMEOUT))
+        ]);
+
+        if (!routes?.routes?.length) {
+            console.log('[LiFi] No routes returned');
+            return null;
+        }
+
         const route = routes.routes[0];
         const step = route.steps[0];
         const tx = await getStepTransaction(step);
-        const richCtx = { lifiQuoteResultCtx: { stepInfo: step, estimate: step.estimate, includedSteps: route.steps }, lifiToNetworkId: params.toNetworkId };
-        const fiatFee = Number(step.estimate?.feeCosts?.[0]?.amountUSD || 0.1) + Number(step.estimate?.gasCosts?.[0]?.amountUSD || 0.1);
+
+        // CRITICAL: Validate tx before returning
+        if (!tx || !tx.to || !tx.data || !ethers.isAddress(tx.to)) {
+            console.error('[LiFi] Invalid tx - missing/invalid to address:', tx);
+            return null;
+        }
+
+        console.log('[LiFi] Success - Generated tx:', {
+            to: tx.to,
+            value: tx.value || '0',
+            gasLimit: tx.gasLimit || 'unknown',
+            dataLength: tx.data.length
+        });
+
+        const richCtx = { 
+            lifiQuoteResultCtx: { stepInfo: step, estimate: step.estimate, includedSteps: route.steps }, 
+            lifiToNetworkId: params.toNetworkId 
+        };
+
+        const fiatFee = Number(step.estimate?.feeCosts?.[0]?.amountUSD || 0.1) + 
+                        Number(step.estimate?.gasCosts?.[0]?.amountUSD || 0.1);
+
         return {
             toAmount: ethers.formatUnits(route.toAmount, route.toToken.decimals),
-            tx, decimals: route.toToken.decimals, symbol: route.toToken.symbol,
-            routesData: [], ctx: richCtx, fiatFee
+            tx,
+            decimals: route.toToken.decimals,
+            symbol: route.toToken.symbol,
+            routesData: [],
+            ctx: richCtx,
+            fiatFee
         };
-    } catch (e) { console.log(`LiFi failed: ${e.message}`); return null; }
+    } catch (e) {
+        console.error('[LiFi] Critical failure:', e.message);
+        if (e.stack) console.error(e.stack.split('\n').slice(0, 3).join('\n'));
+        return null;
+    }
 }
+
 // ==================================================================
 // QUOTE GENERATION & ENDPOINTS
 // ==================================================================
@@ -180,13 +243,14 @@ const SUPPORTED_NETWORKS = [
     { networkId: "evm--8453", network: "ETH", name: "Base", symbol: "ETH", decimals: 18, indexerSupported: true },
     { networkId: "evm--43114", network: "AVAX", name: "Avalanche", symbol: "AVAX", decimals: 18, indexerSupported: true }
 ];
+
 let PROVIDERS_CONFIG = [
     { id: 'Swap1inch', name: '1inch', logo: 'https://common.onekey-asset.com/logo/1Inch.png' },
     { id: 'SwapLifi', name: 'Li.fi (Bitrabo)', logo: 'https://uni.onekey-asset.com/static/logo/lifi.png' },
     { id: 'Swap0x', name: '0x', logo: 'https://uni.onekey-asset.com/static/logo/0xlogo.png' },
     { id: 'SwapOKX', name: 'OKX Dex', logo: 'https://uni.onekey-asset.com/static/logo/OKXDex.png' }
-    // ChangeHero removed due to 403 error
 ];
+
 app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
     const list = PROVIDERS_CONFIG.map(p => ({
         providerInfo: { provider: p.id, name: p.name, logo: p.logo, protocol: "Swap" },
@@ -197,16 +261,20 @@ app.get(['/swap/v1/providers/list', '/providers/list'], (req, res) => {
     }));
     res.json(ok(list));
 });
+
 app.get(['/swap/v1/check-support', '/check-support'], (req, res) =>
     res.json(ok([{ status: 'available', networkId: req.query.networkId }]))
 );
+
 app.get(['/swap/v1/allowance', '/allowance'], (req, res) => res.json(ok("0")));
+
 async function generateAllQuotes(params, eventId) {
     const fromChain = parseInt(params.fromNetworkId.replace('evm--', ''));
     const toChain = parseInt(params.toNetworkId.replace('evm--', ''));
     let amount = params.fromTokenAmount;
     let toDecimals = 18;
     let nativePriceUSD = 0;
+
     try {
         const t = await getToken(fromChain, params.fromTokenAddress || '0x0000000000000000000000000000000000000000');
         amount = ethers.parseUnits(Number(amount).toFixed(t.decimals), t.decimals).toString();
@@ -217,7 +285,9 @@ async function generateAllQuotes(params, eventId) {
     } catch {
         amount = ethers.parseUnits(Number(amount).toFixed(18), 18).toString();
     }
+
     console.log(`[Fetching quotes] Native price: $${nativePriceUSD}`);
+
     const promises = PROVIDERS_CONFIG.map(async (p, i) => {
         let q = null;
         if (fromChain !== toChain) {
@@ -232,11 +302,14 @@ async function generateAllQuotes(params, eventId) {
         console.log(` ✓ ${p.name} OK (fee ~$${q.fiatFee})`);
         return formatQuote(p, params, q, eventId, i === 0);
     });
+
     const results = await Promise.all(promises);
     return results.filter(Boolean);
 }
+
 function formatQuote(providerConf, params, data, eventId, isBest) {
     const rate = new BigNumber(data.toAmount).div(params.fromTokenAmount).toFixed(8);
+
     return {
         info: { provider: providerConf.id, providerName: providerConf.name, providerLogo: providerConf.logo },
         fromTokenInfo: { contractAddress: params.fromTokenAddress || "", networkId: params.fromNetworkId, decimals: 18, symbol: "TOKEN" },
@@ -252,9 +325,9 @@ function formatQuote(providerConf, params, data, eventId, isBest) {
             tx: data.tx,
             providerId: providerConf.id,
             isMock: false,
-            fromAmount: params.fromTokenAmount, // ← added
-            toAmount: data.toAmount, // ← added - critical for preview
-            instantRate: rate, // ← added
+            fromAmount: params.fromTokenAmount,
+            toAmount: data.toAmount,
+            instantRate: rate,
             ...data.ctx
         },
         allowanceResult: null,
@@ -265,10 +338,12 @@ function formatQuote(providerConf, params, data, eventId, isBest) {
         isBest
     };
 }
+
 app.get('/swap/v1/quote/events', async (req, res) => {
     console.log(`⚡ QUOTE EVENTS REQUEST`);
     res.setHeader('Content-Type', 'text/event-stream');
     const eventId = uuidv4();
+
     try {
         const quotes = await generateAllQuotes(req.query, eventId);
         res.write(`data: ${JSON.stringify({ totalQuoteCount: quotes.length, eventId })}\n\n`);
@@ -283,19 +358,30 @@ app.get('/swap/v1/quote/events', async (req, res) => {
     }
     res.end();
 });
+
 app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
     console.log("📝 BUILD-TX CALLED");
     const { quoteResultCtx, userAddress } = req.body;
+
     if (!quoteResultCtx?.tx) {
         console.log("❌ Missing tx in quoteResultCtx");
         return res.json(ok(null));
     }
+
+    // Extra safety: Validate tx before sending to frontend
+    if (!quoteResultCtx.tx.to || !ethers.isAddress(quoteResultCtx.tx.to)) {
+        console.error("Invalid tx.to in build-tx:", quoteResultCtx.tx);
+        return res.json(ok(null));
+    }
+
     try {
         const isLifi = quoteResultCtx.providerId?.includes('Lifi') || false;
         const val = isLifi ? toHex(quoteResultCtx.tx.value) : new BigNumber(quoteResultCtx.tx.value || "0").toFixed();
+
         const feeAmount = new BigNumber(quoteResultCtx.toAmount || "0")
             .multipliedBy(FEE_PERCENT)
             .toFixed(6);
+
         return res.json(ok({
             result: {
                 info: { provider: quoteResultCtx.providerId },
@@ -303,7 +389,7 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
                 fromTokenInfo: quoteResultCtx.fromTokenInfo || { contractAddress: "", networkId: "", decimals: 18, symbol: "TOKEN" },
                 toTokenInfo: quoteResultCtx.toTokenInfo || { contractAddress: "", networkId: "", decimals: 18, symbol: "UNK" },
                 fromAmount: quoteResultCtx.fromAmount || "0",
-                toAmount: quoteResultCtx.toAmount || "0", // ← This fixes 0.00
+                toAmount: quoteResultCtx.toAmount || "0",
                 instantRate: quoteResultCtx.instantRate || "0",
                 estimatedTime: 30,
                 fee: { percentageFee: FEE_PERCENT * 100 },
@@ -325,16 +411,24 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
         return res.json(ok(null));
     }
 });
-// Fallback
+
+// Fallback proxy
 app.use('/swap/v1', (req, res, next) => {
     console.log(`Proxy → OneKey: ${req.method} ${req.path}`);
     next();
 });
+
 app.use('/swap/v1', createProxyMiddleware({
     target: 'https://swap.onekeycn.com',
     changeOrigin: true,
     logLevel: 'silent'
 }));
+
 app.listen(PORT, () => {
-    console.log(`Bitrabo Swap Backend (Est Receive Fix) running on port ${PORT}`);
+    if (!LIFI_API_KEY) {
+        console.warn('⚠️ CRITICAL: LIFI_API_KEY missing in .env - LiFi quotes may fail or produce invalid tx (missing "To" address)');
+    } else {
+        console.log('✅ LiFi API key loaded');
+    }
+    console.log(`Bitrabo Swap Backend (LiFi Fixed + Validation) running on port ${PORT}`);
 });
