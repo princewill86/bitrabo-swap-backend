@@ -192,19 +192,22 @@ async function getLifiQuote(params, amount, fromChain, toChain) {
 
         const route = routes.routes[0];
         const step = route.steps[0];
-        const tx = await getStepTransaction(step);
+        const txResponse = await getStepTransaction(step);
 
-        // CRITICAL: Validate tx before returning
-        if (!tx || !tx.to || !tx.data || !ethers.isAddress(tx.to)) {
-            console.error('[LiFi] Invalid tx - missing/invalid to address:', tx);
+        // LiFi returns nested structure: txResponse.transactionRequest
+        const txRequest = txResponse?.transactionRequest;
+
+        // CRITICAL VALIDATION on nested request
+        if (!txRequest || !txRequest.to || !txRequest.data || !ethers.isAddress(txRequest.to)) {
+            console.error('[LiFi] Invalid transactionRequest - missing/invalid to/data:', txRequest);
             return null;
         }
 
-        console.log('[LiFi] Success - Generated tx:', {
-            to: tx.to,
-            value: tx.value || '0',
-            gasLimit: tx.gasLimit || 'unknown',
-            dataLength: tx.data.length
+        console.log('[LiFi] Success - Generated transactionRequest:', {
+            to: txRequest.to,
+            value: txRequest.value || '0',
+            gasLimit: txRequest.gasLimit || 'unknown',
+            dataLength: txRequest.data.length
         });
 
         const richCtx = { 
@@ -217,7 +220,7 @@ async function getLifiQuote(params, amount, fromChain, toChain) {
 
         return {
             toAmount: ethers.formatUnits(route.toAmount, route.toToken.decimals),
-            tx,
+            tx: txResponse,  // Return full txResponse (with nested transactionRequest)
             decimals: route.toToken.decimals,
             symbol: route.toToken.symbol,
             routesData: [],
