@@ -16,14 +16,14 @@ const PORT = process.env.PORT || 10000;
 const FEE_RECEIVER = process.env.BITRABO_FEE_RECEIVER;
 const FEE_PERCENT = Number(process.env.BITRABO_FEE || 0.0025);
 const LIFI_INTEGRATOR = process.env.BITRABO_INTEGRATOR || 'bitrabo';
-const LIFI_API_KEY = process.env.LIFI_API_KEY; // ← Critical! Add to .env
+const LIFI_API_KEY = process.env.LIFI_API_KEY; // ← Critical! Must be in .env
 const TIMEOUT = 15000;
 
-// Initialize LiFi with API key if provided
+// Initialize LiFi config
 createConfig({ 
   integrator: LIFI_INTEGRATOR, 
   fee: FEE_PERCENT,
-  apiKey: LIFI_API_KEY || undefined  // Will warn in logs if missing
+  apiKey: LIFI_API_KEY || undefined
 });
 
 const GAS_PRICE_ESTIMATES = {
@@ -194,21 +194,15 @@ async function getLifiQuote(params, amount, fromChain, toChain) {
         const step = route.steps[0];
         const txResponse = await getStepTransaction(step);
 
-        // LiFi returns nested structure: txResponse.transactionRequest
-        const txRequest = txResponse?.transactionRequest;
+        // LiFi returns nested transactionRequest
+        const txRequest = txResponse?.transactionRequest || {};
 
-        // CRITICAL VALIDATION on nested request
-        if (!txRequest || !txRequest.to || !txRequest.data || !ethers.isAddress(txRequest.to)) {
-            console.error('[LiFi] Invalid transactionRequest - missing/invalid to/data:', txRequest);
+        if (!txRequest.to || !ethers.isAddress(txRequest.to) || !txRequest.data) {
+            console.error('[LiFi] Invalid nested transactionRequest:', txRequest);
             return null;
         }
 
-        console.log('[LiFi] Success - Generated transactionRequest:', {
-            to: txRequest.to,
-            value: txRequest.value || '0',
-            gasLimit: txRequest.gasLimit || 'unknown',
-            dataLength: txRequest.data.length
-        });
+        console.log('[LiFi] Valid txRequest - to:', txRequest.to);
 
         const richCtx = { 
             lifiQuoteResultCtx: { stepInfo: step, estimate: step.estimate, includedSteps: route.steps }, 
@@ -220,7 +214,7 @@ async function getLifiQuote(params, amount, fromChain, toChain) {
 
         return {
             toAmount: ethers.formatUnits(route.toAmount, route.toToken.decimals),
-            tx: txResponse,  // Return full txResponse (with nested transactionRequest)
+            tx: txResponse,  // Full response with nested transactionRequest
             decimals: route.toToken.decimals,
             symbol: route.toToken.symbol,
             routesData: [],
@@ -229,7 +223,6 @@ async function getLifiQuote(params, amount, fromChain, toChain) {
         };
     } catch (e) {
         console.error('[LiFi] Critical failure:', e.message);
-        if (e.stack) console.error(e.stack.split('\n').slice(0, 3).join('\n'));
         return null;
     }
 }
@@ -371,15 +364,21 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
         return res.json(ok(null));
     }
 
-    // Extra safety: Validate tx before sending to frontend
-    if (!quoteResultCtx.tx.to || !ethers.isAddress(quoteResultCtx.tx.to)) {
-        console.error("Invalid tx.to in build-tx:", quoteResultCtx.tx);
+    // Handle LiFi nested structure for validation
+    let txObj = quoteResultCtx.tx;
+    const isLifi = quoteResultCtx.providerId?.includes('Lifi') || false;
+    if (isLifi && quoteResultCtx.tx?.transactionRequest) {
+        txObj = quoteResultCtx.tx.transactionRequest;
+    }
+
+    // Validate the effective tx object
+    if (!txObj || !txObj.to || !ethers.isAddress(txObj.to)) {
+        console.error("Invalid tx in build-tx:", txObj);
         return res.json(ok(null));
     }
 
     try {
-        const isLifi = quoteResultCtx.providerId?.includes('Lifi') || false;
-        const val = isLifi ? toHex(quoteResultCtx.tx.value) : new BigNumber(quoteResultCtx.tx.value || "0").toFixed();
+        const val = isLifi ? toHex(txObj.value) : new BigNumber(txObj.value || "0").toFixed();
 
         const feeAmount = new BigNumber(quoteResultCtx.toAmount || "0")
             .multipliedBy(FEE_PERCENT)
@@ -396,7 +395,7 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
                 instantRate: quoteResultCtx.instantRate || "0",
                 estimatedTime: 30,
                 fee: { percentageFee: FEE_PERCENT * 100 },
-                gasLimit: Number(quoteResultCtx.tx.gasLimit || 210000),
+                gasLimit: Number(txObj.gasLimit || 210000),
                 routesData: quoteResultCtx.routesData || [],
                 oneKeyFeeExtraInfo: {
                     oneKeyFeeAmount: feeAmount,
@@ -407,7 +406,7 @@ app.post('/swap/v1/build-tx', jsonParser, (req, res) => {
                 supportUrl: "https://help.onekey.so/hc/requests/new"
             },
             ctx: quoteResultCtx,
-            tx: { ...quoteResultCtx.tx, from: userAddress, value: val }
+            tx: { ...txObj, from: userAddress, value: val }  // Use the validated txObj
         }));
     } catch (e) {
         console.error("build-tx error:", e.message);
@@ -429,9 +428,9 @@ app.use('/swap/v1', createProxyMiddleware({
 
 app.listen(PORT, () => {
     if (!LIFI_API_KEY) {
-        console.warn('⚠️ CRITICAL: LIFI_API_KEY missing in .env - LiFi quotes may fail or produce invalid tx (missing "To" address)');
+        console.warn('⚠️ CRITICAL: LIFI_API_KEY missing in .env - LiFi may fail');
     } else {
         console.log('✅ LiFi API key loaded');
     }
-    console.log(`Bitrabo Swap Backend (LiFi Fixed + Validation) running on port ${PORT}`);
+    console.log(`Bitrabo Swap Backend (LiFi Nested Fix) running on port ${PORT}`);
 });
